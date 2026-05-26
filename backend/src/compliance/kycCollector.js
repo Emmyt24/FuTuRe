@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import prisma from '../db/client.js';
 import { encryptToEnvValue, decryptFromEnvValue } from '../config/secrets.js';
+import auditLogger from '../security/auditLogger.js';
 
 const KYC_STATUS = { PENDING: 'PENDING', APPROVED: 'APPROVED', REJECTED: 'REJECTED', UNDER_REVIEW: 'UNDER_REVIEW' };
 
@@ -90,6 +91,11 @@ class KYCCollector {
       where: { userId },
       data: { status },
     });
+    await auditLogger.logEvent('KYC_STATUS_CHANGED', userId, {
+      previousStatus: record.status,
+      newStatus: status,
+      note: note ?? null,
+    }, 'INFO');
     return decryptRecord(updated);
   }
 
