@@ -1,6 +1,7 @@
 const ERROR_MAP = [
   { match: /insufficient balance/i, message: 'Insufficient balance to complete this payment.' },
   { match: /no account found|account not found|404/i, message: 'Destination account does not exist on the Stellar network.' },
+  { match: /ECONNABORTED|ERR_NETWORK/i, message: 'Connection timed out — please check your internet connection.' },
   { match: /network error|failed to fetch|econnrefused|networkerror/i, message: 'Network error — check your connection and try again.' },
   { match: /timeout/i, message: 'Request timed out. The Stellar network may be busy — please retry.' },
   { match: /bad sequence/i, message: 'Transaction sequence error. Please refresh and try again.' },
@@ -56,6 +57,11 @@ export function getFriendlyError(error) {
         return STELLAR_RESULT_CODES[opCode];
       }
     }
+  }
+
+  // Handle axios timeout (ECONNABORTED) and network errors (ERR_NETWORK) by error code
+  if (error?.code === 'ECONNABORTED' || error?.code === 'ERR_NETWORK') {
+    return 'Connection timed out — please check your internet connection.';
   }
 
   // Fall back to string matching
