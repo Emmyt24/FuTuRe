@@ -1,9 +1,10 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import axios from 'axios';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
 import { Spinner } from './Spinner';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { CopyButton } from './CopyButton';
+import { makeVariants, tapScale } from '../utils/animations';
 
 function truncateKey(key) {
   if (!key || key.length <= 8) return key;
@@ -70,7 +71,9 @@ function downloadCsv(rows, filename) {
   URL.revokeObjectURL(url);
 }
 
-function TxRow({ tx, onClick }) {
+function TxRow({ tx, onClick, onRetry }) {
+  const prefersReduced = useReducedMotion();
+  const tap = tapScale(prefersReduced);
   const isReceived = tx.direction === 'received';
   const isSent = tx.direction === 'sent';
   const label = `${TYPE_LABELS[tx.type] ?? tx.type}, ${tx.direction ?? ''}, ${tx.amount ? `${tx.amount} ${tx.asset ?? 'XLM'}` : ''}, ${fmt(tx.date)}, ${tx.successful ? 'successful' : 'failed'}`;
@@ -80,7 +83,7 @@ function TxRow({ tx, onClick }) {
       className="tx-row"
       onClick={() => onClick(tx)}
       onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && onClick(tx)}
-      whileTap={{ scale: 0.98 }}
+      {...tap}
       layout
       role="button"
       tabIndex={0}
@@ -113,6 +116,8 @@ function TxRow({ tx, onClick }) {
 function TxModal({ tx, onClose }) {
   const modalRef = useRef(null);
   useFocusTrap(modalRef, true);
+  const prefersReduced = useReducedMotion();
+  const v = makeVariants(prefersReduced);
 
   useEffect(() => {
     const onKey = (e) => { if (e.key === 'Escape') onClose(); };
@@ -124,15 +129,13 @@ function TxModal({ tx, onClose }) {
     <motion.div
       className="tx-overlay"
       onClick={onClose}
-      initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+      variants={v.fadeSlide} initial="hidden" animate="visible" exit="exit"
     >
       <motion.div
         ref={modalRef}
         className="tx-modal"
         onClick={e => e.stopPropagation()}
-        initial={{ scale: 0.9, opacity: 0 }}
-        animate={{ scale: 1, opacity: 1 }}
-        exit={{ scale: 0.9, opacity: 0 }}
+        variants={v.pop}
         role="dialog"
         aria-modal="true"
         aria-labelledby="tx-modal-title"
@@ -176,6 +179,8 @@ export function TransactionHistory({ publicKey }) {
   const [error, setError] = useState(null);
   const [retrying, setRetrying] = useState({}); // { [txId]: 'pending' | 'success' | 'error' }
   const [exporting, setExporting] = useState(false);
+  const prefersReduced = useReducedMotion();
+  const tap = tapScale(prefersReduced);
 
   const handleExportCsv = async () => {
     setExporting(true);
@@ -247,7 +252,7 @@ export function TransactionHistory({ publicKey }) {
           <motion.button
             onClick={handleExportCsv}
             disabled={exporting || loading}
-            whileTap={{ scale: 0.97 }}
+            {...tap}
             aria-label="Export transaction history as CSV"
             aria-busy={exporting}
             style={{ background: '#16a34a' }}
@@ -258,7 +263,7 @@ export function TransactionHistory({ publicKey }) {
             className="tx-load-btn"
             onClick={handleLoad}
             disabled={loading}
-            whileTap={{ scale: 0.97 }}
+            {...tap}
             aria-label={loaded ? 'Refresh transaction history' : 'Load transaction history'}
           >
             {loading ? <Spinner label="Loading transactions…" /> : loaded ? '↺ Refresh' : 'Load History'}

@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
+import { makeVariants, tapScale } from '../utils/animations';
 
 /**
  * SecurityKeyWarning — displays when secret key is shown.
@@ -7,12 +8,13 @@ import { motion, AnimatePresence } from 'framer-motion';
  * Props: onAcknowledge
  */
 export function SecurityKeyWarning({ onAcknowledge }) {
+  const prefersReduced = useReducedMotion();
+  const v = makeVariants(prefersReduced);
+  const tap = tapScale(prefersReduced);
   return (
     <motion.div
       className="security-warning"
-      initial={{ opacity: 0, scale: 0.95 }}
-      animate={{ opacity: 1, scale: 1 }}
-      exit={{ opacity: 0, scale: 0.95 }}
+      variants={v.pop} initial="hidden" animate="visible" exit="exit"
     >
       <div className="security-warning__header">
         <span className="security-warning__icon">🔐</span>
@@ -48,8 +50,7 @@ export function SecurityKeyWarning({ onAcknowledge }) {
       <div className="security-warning__actions">
         <motion.button
           onClick={() => onAcknowledge?.()}
-          whileHover={{ scale: 1.02 }}
-          whileTap={{ scale: 0.98 }}
+          {...tap}
           className="security-warning__button"
         >
           I Understand the Risks
@@ -67,6 +68,9 @@ export function SecretKeyDisplay({ secretKey, publicKey }) {
   const [revealed, setRevealed] = useState(false);
   const [acknowledged, setAcknowledged] = useState(false);
   const [copied, setCopied] = useState(null);
+  const prefersReduced = useReducedMotion();
+  const v = makeVariants(prefersReduced);
+  const tap = tapScale(prefersReduced);
 
   const handleCopy = (text, label) => {
     navigator.clipboard.writeText(text).then(() => {
@@ -80,8 +84,7 @@ export function SecretKeyDisplay({ secretKey, publicKey }) {
   return (
     <motion.div
       className="secret-key-display"
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
+      variants={v.fadeSlide} initial="hidden" animate="visible"
     >
       {!acknowledged && (
         <SecurityKeyWarning onAcknowledge={() => setAcknowledged(true)} />
@@ -90,9 +93,7 @@ export function SecretKeyDisplay({ secretKey, publicKey }) {
       <AnimatePresence>
         {acknowledged && (
           <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -8 }}
+            variants={v.fadeSlide} initial="hidden" animate="visible" exit="exit"
             style={{ marginBottom: 16 }}
           >
             <div className="secret-key-display__field">
@@ -101,8 +102,7 @@ export function SecretKeyDisplay({ secretKey, publicKey }) {
                 <code className="secret-key-display__code">{publicKey}</code>
                 <motion.button
                   onClick={() => handleCopy(publicKey, 'public')}
-                  whileHover={{ scale: 1.05 }}
-                  whileTap={{ scale: 0.95 }}
+                  {...tap}
                   className="secret-key-display__button"
                 >
                   {copied === 'public' ? '✓ Copied' : 'Copy'}
@@ -118,16 +118,14 @@ export function SecretKeyDisplay({ secretKey, publicKey }) {
                 </code>
                 <motion.button
                   onClick={() => setRevealed(!revealed)}
-                  whileHover={{ scale: 1.05 }}
-                  whileTap={{ scale: 0.95 }}
+                  {...tap}
                   className="secret-key-display__button secret-key-display__button--reveal"
                 >
                   {revealed ? '👁 Hide' : '👁 Show'}
                 </motion.button>
                 <motion.button
                   onClick={() => handleCopy(secretKey, 'secret')}
-                  whileHover={{ scale: 1.05 }}
-                  whileTap={{ scale: 0.95 }}
+                  {...tap}
                   disabled={!revealed}
                   className="secret-key-display__button secret-key-display__button--copy"
                 >
@@ -138,9 +136,7 @@ export function SecretKeyDisplay({ secretKey, publicKey }) {
 
             <motion.div
               className="secret-key-display__tip"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ delay: 0.3 }}
+              variants={v.fadeSlide} initial="hidden" animate="visible"
             >
               💡 <strong>Tip:</strong> Save both keys somewhere secure before leaving this page.
               They will not be displayed again.
