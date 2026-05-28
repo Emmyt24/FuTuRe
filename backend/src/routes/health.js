@@ -1,8 +1,12 @@
 import express from 'express';
 import os from 'os';
 import * as StellarService from '../services/stellar.js';
-import { eventMonitor } from '../eventSourcing/index.js';
+import { eventMonitor, eventStore } from '../eventSourcing/index.js';
 import { auditLogger } from '../security/index.js';
+import { requireAuth } from '../middleware/auth.js';
+import { analytics as cacheAnalytics, monitor as cacheMonitor } from '../cache/appCache.js';
+import prisma from '../db/client.js';
+import { getMetrics as getBackupMetrics } from '../backup/manager.js';
 
 const router = express.Router();
 
@@ -15,7 +19,7 @@ function getSystemInfo() {
     totalmem: os.totalmem(),
     freemem: os.freemem(),
     cpus: os.cpus().length,
-    hostname: os.hostname()
+    hostname: os.hostname(),
   };
 }
 
@@ -25,7 +29,7 @@ function getApplicationInfo() {
     nodeVersion: process.version,
     environment: process.env.NODE_ENV || 'development',
     startTime: new Date().toISOString(),
-    processId: process.pid
+    processId: process.pid,
   };
 }
 
@@ -39,13 +43,13 @@ async function checkStellarConnectivity() {
       online: status.online,
       horizonVersion: status.horizonVersion,
       currentProtocolVersion: status.currentProtocolVersion,
-      responseTime: Date.now()
+      responseTime: Date.now(),
     };
   } catch (error) {
     return {
       status: 'unhealthy',
       error: error.message,
-      responseTime: Date.now()
+      responseTime: Date.now(),
     };
   }
 }
@@ -56,63 +60,66 @@ async function checkDatabaseConnectivity() {
   try {
     const eventMonitorStatus = eventMonitor.isInitialized ? 'healthy' : 'unhealthy';
     const auditLoggerStatus = auditLogger.isInitialized ? 'healthy' : 'unhealthy';
-    
+
     return {
-      status: eventMonitorStatus === 'healthy' && auditLoggerStatus === 'healthy' ? 'healthy' : 'unhealthy',
+      status:
+        eventMonitorStatus === 'healthy' && auditLoggerStatus === 'healthy'
+          ? 'healthy'
+          : 'unhealthy',
       eventMonitor: eventMonitorStatus,
       auditLogger: auditLoggerStatus,
-      type: 'event-sourcing'
+      type: 'event-sourcing',
     };
   } catch (error) {
     return {
       status: 'unhealthy',
       error: error.message,
-      type: 'event-sourcing'
+      type: 'event-sourcing',
     };
   }
 }
 
 async function checkDependencies() {
   const checks = [];
-  
+
   // Check Stellar SDK
   try {
     const stellarStatus = await checkStellarConnectivity();
     checks.push({
       name: '@stellar/stellar-sdk',
       status: stellarStatus.status,
-      version: '12.3.0'
+      version: '12.3.0',
     });
   } catch (error) {
     checks.push({
       name: '@stellar/stellar-sdk',
       status: 'unhealthy',
-      error: error.message
+      error: error.message,
     });
   }
-  
+
   // Check Express (core framework)
   checks.push({
     name: 'express',
     status: 'healthy',
-    version: '4.19.2'
+    version: '4.19.2',
   });
-  
+
   // Check WebSocket
   checks.push({
     name: 'ws',
     status: 'healthy',
-    version: '8.20.0'
+    version: '8.20.0',
   });
-  
+
   return {
-    overall: checks.every(c => c.status === 'healthy') ? 'healthy' : 'unhealthy',
-    dependencies: checks
+    overall: checks.every((c) => c.status === 'healthy') ? 'healthy' : 'unhealthy',
+    dependencies: checks,
   };
 }
 
 function calculateHealthPercentage(checks) {
-  const healthyCount = checks.filter(check => check.status === 'healthy').length;
+  const healthyCount = checks.filter((check) => check.status === 'healthy').length;
   return Math.round((healthyCount / checks.length) * 100);
 }
 
@@ -123,15 +130,15 @@ router.get('/health', async (req, res) => {
     const stellarCheck = await checkStellarConnectivity();
     const databaseCheck = await checkDatabaseConnectivity();
     const dependencyCheck = await checkDependencies();
-    
+
     const healthChecks = [
       { name: 'stellar', ...stellarCheck },
-      { name: 'database', ...databaseCheck }
+      { name: 'database', ...databaseCheck },
     ];
-    
+
     const overallHealth = calculateHealthPercentage(healthChecks);
     const status = overallHealth >= 80 ? 'healthy' : overallHealth >= 50 ? 'degraded' : 'unhealthy';
-    
+
     const healthData = {
       status,
       overallHealth,
@@ -140,16 +147,16 @@ router.get('/health', async (req, res) => {
       checks: healthChecks,
       dependencies: dependencyCheck,
       system: systemInfo,
-      application: appInfo
+      application: appInfo,
     };
-    
+
     const statusCode = status === 'healthy' ? 200 : status === 'degraded' ? 200 : 503;
     res.status(statusCode).json(healthData);
   } catch (error) {
     res.status(500).json({
       status: 'unhealthy',
       error: error.message,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     });
   }
 });
@@ -159,7 +166,7 @@ router.get('/health/live', (req, res) => {
   res.status(200).json({
     status: 'alive',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
   });
 });
 
@@ -168,25 +175,25 @@ router.get('/health/ready', async (req, res) => {
     // Readiness probe - checks if the application is ready to serve traffic
     const stellarCheck = await checkStellarConnectivity();
     const databaseCheck = await checkDatabaseConnectivity();
-    
+
     const isReady = stellarCheck.status === 'healthy' && databaseCheck.status === 'healthy';
-    
+
     const readinessData = {
       status: isReady ? 'ready' : 'not_ready',
       timestamp: new Date().toISOString(),
       checks: {
         stellar: stellarCheck.status,
-        database: databaseCheck.status
-      }
+        database: databaseCheck.status,
+      },
     };
-    
+
     const statusCode = isReady ? 200 : 503;
     res.status(statusCode).json(readinessData);
   } catch (error) {
     res.status(503).json({
       status: 'not_ready',
       error: error.message,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     });
   }
 });
@@ -196,7 +203,7 @@ router.get('/metrics', (req, res) => {
     const systemInfo = getSystemInfo();
     const appInfo = getApplicationInfo();
     const memoryUsage = process.memoryUsage();
-    
+
     const metrics = {
       timestamp: new Date().toISOString(),
       application: {
@@ -204,7 +211,7 @@ router.get('/metrics', (req, res) => {
         nodeVersion: appInfo.nodeVersion,
         environment: appInfo.environment,
         processId: appInfo.processId,
-        uptime: process.uptime()
+        uptime: process.uptime(),
       },
       system: {
         platform: systemInfo.platform,
@@ -216,8 +223,10 @@ router.get('/metrics', (req, res) => {
           total: systemInfo.totalmem,
           free: systemInfo.freemem,
           used: systemInfo.totalmem - systemInfo.freemem,
-          usagePercentage: Math.round(((systemInfo.totalmem - systemInfo.freemem) / systemInfo.totalmem) * 100)
-        }
+          usagePercentage: Math.round(
+            ((systemInfo.totalmem - systemInfo.freemem) / systemInfo.totalmem) * 100
+          ),
+        },
       },
       process: {
         memory: {
@@ -225,17 +234,128 @@ router.get('/metrics', (req, res) => {
           heapTotal: memoryUsage.heapTotal,
           heapUsed: memoryUsage.heapUsed,
           external: memoryUsage.external,
-          arrayBuffers: memoryUsage.arrayBuffers
+          arrayBuffers: memoryUsage.arrayBuffers,
         },
-        cpuUsage: process.cpuUsage()
-      }
+        cpuUsage: process.cpuUsage(),
+      },
     };
-    
+
     res.json(metrics);
   } catch (error) {
     res.status(500).json({
       error: error.message,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+/**
+ * @swagger
+ * /health/detailed:
+ *   get:
+ *     summary: Detailed system health (auth-gated)
+ *     description: >
+ *       Returns extended health information including cache status, event store
+ *       queue depth, active stream count, pending multi-sig transaction count,
+ *       and last backup timestamp. Requires a valid Bearer token.
+ *     tags: [Health]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Detailed health report
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 status:
+ *                   type: string
+ *                   enum: [healthy, degraded, unhealthy]
+ *                 timestamp:
+ *                   type: string
+ *                   format: date-time
+ *                 cache:
+ *                   type: object
+ *                 eventStore:
+ *                   type: object
+ *                 streams:
+ *                   type: object
+ *                 multiSig:
+ *                   type: object
+ *                 backup:
+ *                   type: object
+ *       401:
+ *         description: Unauthorized
+ *       500:
+ *         description: Server error
+ */
+router.get('/health/detailed', requireAuth, async (req, res) => {
+  try {
+    const [activeStreamCount, pendingMultiSigCount, eventQueueDepth] = await Promise.all([
+      prisma.paymentStream.count({ where: { status: 'ACTIVE' } }).catch(() => null),
+      prisma.pendingMultiSigTx.count({ where: { status: 'pending' } }).catch(() => null),
+      // eventStore.events holds in-memory events appended since startup
+      Promise.resolve(eventStore.events?.length ?? 0),
+    ]);
+
+    const cacheStats = cacheMonitor.getPerformanceStats();
+    const cacheAlerts = cacheMonitor.getAlerts().slice(-5);
+
+    const backupMetrics = (() => {
+      try {
+        return getBackupMetrics();
+      } catch {
+        return null;
+      }
+    })();
+
+    const checks = [
+      { name: 'cache', status: cacheStats ? 'healthy' : 'unknown' },
+      { name: 'eventStore', status: eventStore.initialized ? 'healthy' : 'unhealthy' },
+      { name: 'streams', status: activeStreamCount !== null ? 'healthy' : 'unknown' },
+      { name: 'multiSig', status: pendingMultiSigCount !== null ? 'healthy' : 'unknown' },
+      { name: 'backup', status: backupMetrics ? 'healthy' : 'unknown' },
+    ];
+
+    const unhealthyCount = checks.filter((c) => c.status === 'unhealthy').length;
+    const overallStatus =
+      unhealthyCount === 0 ? 'healthy' : unhealthyCount < checks.length ? 'degraded' : 'unhealthy';
+
+    res.json({
+      status: overallStatus,
+      timestamp: new Date().toISOString(),
+      cache: {
+        status: cacheStats ? 'healthy' : 'unknown',
+        performance: cacheStats,
+        recentAlerts: cacheAlerts,
+      },
+      eventStore: {
+        status: eventStore.initialized ? 'healthy' : 'unhealthy',
+        initialized: eventStore.initialized ?? false,
+        queueDepth: eventQueueDepth,
+      },
+      streams: {
+        status: activeStreamCount !== null ? 'healthy' : 'unknown',
+        activeCount: activeStreamCount,
+      },
+      multiSig: {
+        status: pendingMultiSigCount !== null ? 'healthy' : 'unknown',
+        pendingTransactions: pendingMultiSigCount,
+      },
+      backup: {
+        status: backupMetrics ? 'healthy' : 'unknown',
+        lastBackupAt: backupMetrics?.lastBackupAt ?? null,
+        lastBackupSize: backupMetrics?.lastBackupSize ?? null,
+        totalBackups: backupMetrics?.totalBackups ?? null,
+        encryptionEnabled: backupMetrics?.encryptionEnabled ?? null,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'unhealthy',
+      error: error.message,
+      timestamp: new Date().toISOString(),
     });
   }
 });
