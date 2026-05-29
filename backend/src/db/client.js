@@ -7,6 +7,8 @@ import { setupSoftDeleteMiddleware } from './softDelete.js';
 
 const { Pool } = pg;
 
+// Configurable query timeout in milliseconds (default: 5 000 ms)
+const QUERY_TIMEOUT_MS = parseInt(process.env.DB_QUERY_TIMEOUT_MS ?? '5000', 10);
 const appEnv = (process.env.APP_ENV || process.env.NODE_ENV || 'development').trim().toLowerCase();
 const isDev = appEnv === 'development';
 
@@ -44,8 +46,18 @@ const pool = new Pool({
   connectionTimeoutMillis: 5_000,
 });
 
+// Layer 1 — PostgreSQL server-side timeout.
+// Set statement_timeout on every new connection so the DB engine itself
+// cancels statements that exceed the threshold, freeing the connection.
+pool.on('connect', (client) => {
+  client.query(`SET statement_timeout = ${QUERY_TIMEOUT_MS}`).catch((err) =>
+    logger.error('db.statement_timeout.set.failed', { error: err.message })
+  );
+});
+
 const adapter = new PrismaPg(pool);
 
+const baseClient = new PrismaClient({
 // Enable query-level logging in development or when PRISMA_QUERY_LOG=true.
 const queryLogEnabled = isDev || process.env.PRISMA_QUERY_LOG === 'true';
 
@@ -60,8 +72,28 @@ const prisma = new PrismaClient({
   log: prismaLogConfig,
 });
 
-prisma.$on('error', (e) => logger.error('db.error', { message: e.message, target: e.target }));
-prisma.$on('warn',  (e) => logger.warn('db.warn',  { message: e.message, target: e.target }));
+// Layer 2 — Node.js-side timeout via Prisma client extension.
+// A Promise.race wraps every Prisma operation so callers receive a rejected
+// promise if the DB hasn't responded within DB_QUERY_TIMEOUT_MS, regardless
+// of whether the server-side statement_timeout has fired yet.
+const prisma = baseClient.$extends({
+  query: {
+    $allModels: {
+      async $allOperations({ args, query }) {
+        const timeout = new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`DB query timed out after ${QUERY_TIMEOUT_MS}ms`)),
+            QUERY_TIMEOUT_MS
+          )
+        );
+        return Promise.race([query(args), timeout]);
+      },
+    },
+  },
+});
+
+baseClient.$on('error', (e) => logger.error('db.error', { message: e.message, target: e.target }));
+baseClient.$on('warn',  (e) => logger.warn('db.warn',  { message: e.message, target: e.target }));
 
 if (queryLogEnabled) {
   prisma.$on('query', (e) => {
@@ -76,12 +108,12 @@ if (queryLogEnabled) {
 setupSoftDeleteMiddleware(prisma);
 
 export async function connectDB() {
-  await prisma.$connect();
+  await baseClient.$connect();
   logger.info('db.connected');
 }
 
 export async function disconnectDB() {
-  await prisma.$disconnect();
+  await baseClient.$disconnect();
   await pool.end();
   logger.info('db.disconnected');
 }
@@ -96,4 +128,5 @@ export async function checkDBHealth() {
   }
 }
 
+export { QUERY_TIMEOUT_MS };
 export default prisma;
