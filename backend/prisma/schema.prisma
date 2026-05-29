@@ -9,7 +9,6 @@ datasource db {
 }
 
 model User {
- ci/add-migration-smoke-test
   id                      String                   @id @default(uuid())
   publicKey               String                   @unique
   createdAt               DateTime                 @default(now())
@@ -41,7 +40,6 @@ model User {
   notificationPreference NotificationPreference?
   kycRecord              KYCRecord?
   amlAlerts              AMLAlert[]
- main
 }
 
 model Transaction {
@@ -50,7 +48,6 @@ model Transaction {
   assetCode     String         @default("XLM")
   amount        Decimal
   ledger        Int?
- ci/add-migration-smoke-test
   successful    Boolean         @default(true)
   createdAt     DateTime        @default(now())
   updatedAt     DateTime        @updatedAt
@@ -60,7 +57,6 @@ model Transaction {
   memo          String?
   memoType      String?        // 'text' | 'id'
   createdAt     DateTime       @default(now())
- main
   senderId      String
   sender        User           @relation("sender", fields: [senderId], references: [id])
   recipientId   String
@@ -69,7 +65,6 @@ model Transaction {
   retryStatus   String?
   lastRetryAt   DateTime?
   retryHistory  RetryAttempt[]
- ci/add-migration-smoke-test
 
   @@index([deletedAt])
 
@@ -79,7 +74,6 @@ model Transaction {
 
   @@index([senderId, createdAt])
   @@index([recipientId, createdAt])
- main
 }
 
 model RetryAttempt {
@@ -132,7 +126,6 @@ model PaymentStream {
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt
 
- ci/add-migration-smoke-test
   @@index([senderId])
   @@index([recipientId])
 }
@@ -140,7 +133,6 @@ model PaymentStream {
   @@index([status, lastProcessedAt])
 }
 
- main
   @@index([senderId])
   @@index([recipientId])
 }
@@ -164,7 +156,6 @@ model Notification {
 }
 
 model NotificationPreference {
- ci/add-migration-smoke-test
   id               String   @id @default(uuid())
   userId           String   @unique
   user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -188,7 +179,6 @@ model NotificationPreference {
   quietHoursEnd   Int      @default(7)
   typeOverrides   Json?
   updatedAt       DateTime @updatedAt
- main
 }
 
 model KYCRecord {
@@ -223,7 +213,6 @@ model AMLAlert {
   description   String
   riskScore     Int
   riskLevel     String
- ci/add-migration-smoke-test
   createdAt     DateTime @default(now())
 
   @@index([transactionId])
@@ -237,7 +226,6 @@ model AMLAlert {
   createdAt     DateTime    @default(now())
 
   @@index([status, expiresAt])
- main
   @@index([transactionId])
   @@index([userId])
 }

@@ -46,14 +46,10 @@ import {
 import { securityMiddleware } from './middleware/securityHeaders.js';
 import { sanitizeInputs } from './middleware/sanitize.js';
 import { startScheduler, stopScheduler } from './scheduler.js';
-
-dotenv.config();
 import { csrfTokenMiddleware, validateCSRFMiddleware, csrfTokenEndpoint } from './middleware/csrf.js';
 import dotenv from 'dotenv';
 
-const logger = {
-  info: (event, data) => console.log(`[${event}]`, data),
-};
+dotenv.config();
 
 const app = express();
 const PORT = getConfig().server.port;
