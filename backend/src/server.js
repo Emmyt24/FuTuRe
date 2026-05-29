@@ -80,8 +80,20 @@ app.use((err, req, res, next) => {
   }
   next(err);
 });
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: false, limit: '10mb' }));
+
+// Global body size limit (1kb for most endpoints)
+app.use(express.json({ limit: '1kb' }));
+app.use(express.urlencoded({ extended: false, limit: '1kb' }));
+
+// Larger body size limit for specific routes that need it (file uploads, KYC, etc.)
+const largeBodyLimit = express.json({ limit: '100kb' });
+const largeUrlEncodedLimit = express.urlencoded({ extended: false, limit: '100kb' });
+
+// Apply larger limits to routes that need them
+app.use('/api/v1/backup', largeBodyLimit, largeUrlEncodedLimit);
+app.use('/api/v1/compliance', largeBodyLimit, largeUrlEncodedLimit);
+app.use('/api/v1/recovery', largeBodyLimit, largeUrlEncodedLimit);
+
 app.use(requestIdMiddleware);
 app.use(requestLogger);
 
