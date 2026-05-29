@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 import { getFriendlyError } from '../utils/errorMessages';
 import { formatBalanceWithAsset } from '../utils/formatBalance';
 import { useAppState, useAppDispatch, A } from '../store/index.js';
@@ -11,14 +11,6 @@ import { CopyButton } from '../components/CopyButton';
 import { QRCodeModal } from '../components/QRCodeModal';
 import { FeeDisplay } from '../components/FeeDisplay';
 import { logError } from '../utils/errorLogger';
-
-const TIMEOUT_MS = 30000;
-
-function withTimeout(promiseFn) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  return promiseFn(controller.signal).finally(() => clearTimeout(timer));
-}
 
 export function AccountDashboardPage() {
   const { account, balance, loading, accountLabel } = useAppState();
@@ -40,9 +32,7 @@ export function AccountDashboardPage() {
     if (!account) return;
     dispatch({ type: A.SET_LOADING, payload: 'balance' });
     try {
-      const { data } = await withTimeout(signal =>
-        axios.get(`/api/stellar/account/${account.publicKey}`, { signal })
-      );
+      const { data } = await apiClient.get(`/api/stellar/account/${account.publicKey}`);
       dispatch({ type: A.SET_BALANCE, payload: data });
     } catch (error) {
       logError(error, { context: 'checkBalance' });
@@ -55,7 +45,7 @@ export function AccountDashboardPage() {
   const saveLabel = async () => {
     if (!account) return;
     try {
-      await axios.put(`/api/stellar/account/${account.publicKey}/label`, { accountLabel: labelDraft });
+      await apiClient.put(`/api/stellar/account/${account.publicKey}/label`, { accountLabel: labelDraft });
       dispatch({ type: A.SET_LABEL, payload: labelDraft });
       setEditingLabel(false);
     } catch (error) {

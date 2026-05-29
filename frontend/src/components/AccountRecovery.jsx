@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 
 const STEPS = ['phrase', 'contacts', 'recover'];
 
@@ -24,10 +24,10 @@ export function AccountRecovery() {
 
   // Check if phrase is already configured
   useEffect(() => {
-    axios.get('/api/recovery/phrase/status')
+    apiClient.get('/api/recovery/phrase/status')
       .then(({ data }) => setPhraseStatus(data.configured))
       .catch(() => {});
-    axios.get('/api/recovery/contacts')
+    apiClient.get('/api/recovery/contacts')
       .then(({ data }) => setContacts(data.contacts ?? []))
       .catch(() => {});
   }, []);
@@ -40,7 +40,7 @@ export function AccountRecovery() {
 
   // Step 1: Setup phrase
   const setupPhrase = () => call(async () => {
-    const { data } = await axios.post('/api/recovery/phrase/setup');
+    const { data } = await apiClient.post('/api/recovery/phrase/setup');
     setPhrase(data.phrase);
     setPhraseStatus(true);
     setMsg(data.warning);
@@ -48,25 +48,25 @@ export function AccountRecovery() {
 
   // Step 2: Add contact
   const addContact = () => call(async () => {
-    const { data } = await axios.post('/api/recovery/contacts', newContact);
+    const { data } = await apiClient.post('/api/recovery/contacts', newContact);
     setContacts((c) => [...c, data.contact]);
     setNewContact({ name: '', email: '' });
   });
 
   const removeContact = (id) => call(async () => {
-    await axios.delete(`/api/recovery/contacts/${id}`);
+    await apiClient.delete(`/api/recovery/contacts/${id}`);
     setContacts((c) => c.filter((x) => x.id !== id));
   });
 
   // Step 3: Initiate recovery
   const initiateRecovery = () => call(async () => {
-    const { data } = await axios.post('/api/recovery/initiate', { userId: recoverUserId, method: 'phrase' });
+    const { data } = await apiClient.post('/api/recovery/initiate', { userId: recoverUserId, method: 'phrase' });
     setRequestId(data.requestId);
     setMsg(data.message);
   });
 
   const verifyPhrase = () => call(async () => {
-    const { data } = await axios.post(`/api/recovery/${requestId}/verify-phrase`, { phrase: recoverPhrase });
+    const { data } = await apiClient.post(`/api/recovery/${requestId}/verify-phrase`, { phrase: recoverPhrase });
     setMsg(`Phrase verified. Status: ${data.status}. Recovery unlocks after time-lock.`);
   });
 

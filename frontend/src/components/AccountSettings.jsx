@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 import { AddressBook } from './AddressBook';
 import { WebhookManager } from './WebhookManager';
 import { BackupSettings } from './BackupSettings';
@@ -19,7 +19,7 @@ export function AccountSettings({ publicKey, onClose }) {
   const [userRole, setUserRole] = useState(null);
 
   useEffect(() => {
-    axios.get(`/api/stellar/account/${publicKey}/settings`)
+    apiClient.get(`/api/stellar/account/${publicKey}/settings`)
       .then(({ data }) => {
         setSettings(data);
         // Check if user has admin role from JWT token
@@ -41,7 +41,7 @@ export function AccountSettings({ publicKey, onClose }) {
     setError(null);
     setSaved(false);
     try {
-      await axios.put(`/api/stellar/account/${publicKey}/settings`, {
+      await apiClient.put(`/api/stellar/account/${publicKey}/settings`, {
         defaultAsset: settings.defaultAsset,
         notificationsOn: settings.notificationsOn,
       });

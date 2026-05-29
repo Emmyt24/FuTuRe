@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const NOTIFICATION_COLORS = {
@@ -84,7 +84,7 @@ export function NotificationBell() {
 
   const fetchNotifications = useCallback(async () => {
     try {
-      const { data } = await axios.get('/api/notifications');
+      const { data } = await apiClient.get('/api/notifications');
       setNotifications(data || []);
       const unread = (data || []).filter((n) => !n.read).length;
       setUnreadCount(unread);
@@ -103,7 +103,7 @@ export function NotificationBell() {
   const handleMarkAsRead = async (notificationId) => {
     setMarkingAsRead(notificationId);
     try {
-      await axios.patch(`/api/notifications/${notificationId}/read`);
+      await apiClient.patch(`/api/notifications/${notificationId}/read`);
       
       setNotifications((prev) =>
         prev.map((n) =>
@@ -120,7 +120,7 @@ export function NotificationBell() {
 
   const handleMarkAllAsRead = async () => {
     try {
-      await axios.post('/api/notifications/read-all');
+      await apiClient.post('/api/notifications/read-all');
       setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
       setUnreadCount(0);
     } catch (e) {

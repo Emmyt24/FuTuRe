@@ -1,9 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import App from '../src/App';
-import axios from 'axios';
+import apiClient from '../src/api/client.js';
 
-vi.mock('axios');
+vi.mock('../src/api/client.js', () => ({
+  default: {
+    get: vi.fn(),
+    post: vi.fn(),
+    put: vi.fn(),
+    patch: vi.fn(),
+    delete: vi.fn(),
+  },
+}));
 
 describe('XLMInfoIcon Integration Tests', () => {
   beforeEach(() => {
@@ -14,8 +22,8 @@ describe('XLMInfoIcon Integration Tests', () => {
     Storage.prototype.setItem = vi.fn();
     
     // Mock axios responses
-    axios.get.mockResolvedValue({ data: {} });
-    axios.post.mockResolvedValue({ data: {} });
+    apiClient.get.mockResolvedValue({ data: {} });
+    apiClient.post.mockResolvedValue({ data: {} });
   });
 
   describe('Balance Display Integration', () => {
@@ -32,8 +40,8 @@ describe('XLMInfoIcon Integration Tests', () => {
         ]
       };
 
-      axios.post.mockResolvedValueOnce({ data: mockAccount });
-      axios.get.mockResolvedValueOnce({ data: mockBalance });
+      apiClient.post.mockResolvedValueOnce({ data: mockAccount });
+      apiClient.get.mockResolvedValueOnce({ data: mockBalance });
 
       render(<App />);
       
@@ -70,8 +78,8 @@ describe('XLMInfoIcon Integration Tests', () => {
         ]
       };
 
-      axios.post.mockResolvedValueOnce({ data: mockAccount });
-      axios.get.mockResolvedValueOnce({ data: mockBalance });
+      apiClient.post.mockResolvedValueOnce({ data: mockAccount });
+      apiClient.get.mockResolvedValueOnce({ data: mockBalance });
 
       render(<App />);
       
@@ -102,7 +110,7 @@ describe('XLMInfoIcon Integration Tests', () => {
         secretKey: 'STEST123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABC'
       };
 
-      axios.post.mockResolvedValueOnce({ data: mockAccount });
+      apiClient.post.mockResolvedValueOnce({ data: mockAccount });
 
       render(<App />);
       
@@ -128,7 +136,7 @@ describe('XLMInfoIcon Integration Tests', () => {
         secretKey: 'STEST123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABC'
       };
 
-      axios.post.mockResolvedValueOnce({ data: mockAccount });
+      apiClient.post.mockResolvedValueOnce({ data: mockAccount });
 
       render(<App />);
       
@@ -160,8 +168,8 @@ describe('XLMInfoIcon Integration Tests', () => {
         balances: [{ asset: 'XLM', balance: '2000.0000000' }]
       };
 
-      axios.post.mockResolvedValueOnce({ data: mockAccount });
-      axios.get.mockImplementation((url) => {
+      apiClient.post.mockResolvedValueOnce({ data: mockAccount });
+      apiClient.get.mockImplementation((url) => {
         if (url.includes('/balance') || url.includes('/account/')) {
           return Promise.resolve({ data: mockBalance });
         }
@@ -205,7 +213,7 @@ describe('XLMInfoIcon Integration Tests', () => {
         secretKey: 'STEST123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABC'
       };
 
-      axios.post.mockResolvedValueOnce({ data: mockAccount });
+      apiClient.post.mockResolvedValueOnce({ data: mockAccount });
 
       render(<App />);
       
@@ -237,9 +245,9 @@ describe('XLMInfoIcon Integration Tests', () => {
         balances: [{ asset: 'XLM', balance: '100.0000000' }]
       };
 
-      axios.post.mockResolvedValueOnce({ data: mockAccount });
-      axios.get.mockResolvedValueOnce({ data: mockBalance });
-      axios.post.mockResolvedValueOnce({ 
+      apiClient.post.mockResolvedValueOnce({ data: mockAccount });
+      apiClient.get.mockResolvedValueOnce({ data: mockBalance });
+      apiClient.post.mockResolvedValueOnce({ 
         data: { hash: 'abc123', success: true } 
       });
 
@@ -269,7 +277,7 @@ describe('XLMInfoIcon Integration Tests', () => {
         fireEvent.click(sendButton);
         // Form should process normally
         await waitFor(() => {
-          expect(axios.post).toHaveBeenCalled();
+          expect(apiClient.post).toHaveBeenCalled();
         }, { timeout: 3000 });
       }
     });
@@ -288,8 +296,8 @@ describe('XLMInfoIcon Integration Tests', () => {
         ]
       };
 
-      axios.post.mockResolvedValueOnce({ data: mockAccount });
-      axios.get.mockResolvedValueOnce({ data: mockBalance });
+      apiClient.post.mockResolvedValueOnce({ data: mockAccount });
+      apiClient.get.mockResolvedValueOnce({ data: mockBalance });
 
       const { container } = render(<App />);
       
@@ -322,7 +330,7 @@ describe('XLMInfoIcon Integration Tests', () => {
         secretKey: 'STEST123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABC'
       };
 
-      axios.post.mockResolvedValueOnce({ data: mockAccount });
+      apiClient.post.mockResolvedValueOnce({ data: mockAccount });
 
       const { container } = render(<App />);
       

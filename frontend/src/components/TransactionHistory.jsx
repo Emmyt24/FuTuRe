@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
 import { Spinner } from './Spinner';
 import { SkeletonCard } from './Skeleton';
@@ -30,7 +30,7 @@ async function fetchAllTransactions(publicKey) {
   let cursor = null;
   do {
     const params = { limit: 50, ...(cursor ? { cursor } : {}) };
-    const { data } = await axios.get(`/api/stellar/account/${publicKey}/transactions`, { params });
+    const { data } = await apiClient.get(`/api/stellar/account/${publicKey}/transactions`, { params });
     all.push(...(data.records ?? []));
     cursor = data.nextCursor ?? null;
   } while (cursor);
@@ -197,7 +197,7 @@ export function TransactionHistory({ publicKey }) {
       if (filters.dateFrom) params.dateFrom = filters.dateFrom;
       if (filters.dateTo) params.dateTo = filters.dateTo;
       if (filters.hash) params.hash = filters.hash;
-      const { data } = await axios.get(`/api/stellar/account/${publicKey}/transactions`, { params });
+      const { data } = await apiClient.get(`/api/stellar/account/${publicKey}/transactions`, { params });
       setTxs(data.records);
       setNextCursor(data.nextCursor);
       setLoaded(true);
@@ -227,7 +227,7 @@ export function TransactionHistory({ publicKey }) {
   const handleRetry = useCallback(async (tx) => {
     setRetrying(r => ({ ...r, [tx.id]: 'pending' }));
     try {
-      await axios.post('/api/retry/transaction', { transactionHash: tx.hash });
+      await apiClient.post('/api/retry/transaction', { transactionHash: tx.hash });
       setRetrying(r => ({ ...r, [tx.id]: 'success' }));
       setTxs(prev => prev.map(t => t.id === tx.id ? { ...t, successful: true } : t));
     } catch {

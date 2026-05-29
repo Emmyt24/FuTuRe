@@ -5,7 +5,6 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { initWebVitals } from './utils/webVitals';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { AppStateProvider } from './store/index.js';
-import './utils/axiosConfig.js'; // Initialize axios with API v1 base URL
 import { queryClient } from './config/queryClient';
 import './index.css';
 

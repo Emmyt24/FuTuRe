@@ -1,5 +1,14 @@
 import { useState, useEffect, useCallback, lazy, Suspense } from 'react';
-import axios from 'axios';
+import apiClient from './api/client.js';
+import { getKycStatus } from './api/compliance.js';
+import {
+  createAccount as createStellarAccount,
+  importAccount as importStellarAccount,
+  getAccount,
+  getAccountLabel,
+  updateAccountLabel,
+  sendPayment as sendStellarPayment,
+} from './api/stellar.js';
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
 import { isValidStellarAddress } from './utils/validateStellarAddress';
 import { validateAmount, formatAmount } from './utils/validateAmount';
@@ -53,14 +62,7 @@ const KYCForm = lazy(() => import('./components/KYCForm').then(m => ({ default: 
 const ComplianceDashboard = lazy(() => import('./components/ComplianceDashboard').then(m => ({ default: m.ComplianceDashboard })));
 const BackupSettings = lazy(() => import('./components/BackupSettings').then(m => ({ default: m.BackupSettings })));
 
-const TIMEOUT_MS = 30000;
 const KYC_LARGE_TRANSACTION_LIMIT = 1000;
-
-function withTimeout(promiseFn) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  return promiseFn(controller.signal).finally(() => clearTimeout(timer));
-}
 
 function App() {
   const { account, balance, loading, recipient, amount, memo, memoType, showQR, showImportForm, showShortcuts, accountLabel } = useAppState();
@@ -173,12 +175,12 @@ function App() {
     let anyFailed = false;
     for (const item of pendingItems) {
       try {
-        await withTimeout(signal => axios.post('/api/stellar/payment/send', {
+        await sendStellarPayment({
           sourceSecret: replaySecret,
           destination: item.destination,
           amount: item.amount,
           assetCode: item.assetCode,
-        }, { signal }));
+        });
         await dequeue(item.id);
       } catch (error) {
         anyFailed = true;
@@ -192,8 +194,8 @@ function App() {
 
   const loadLabel = useCallback(async (publicKey) => {
     try {
-      const { data } = await axios.get(`/api/stellar/account/${publicKey}/label`);
-      dispatch({ type: A.SET_LABEL, payload: data.accountLabel ?? '' });
+      const accountLabel = await getAccountLabel(publicKey);
+      dispatch({ type: A.SET_LABEL, payload: accountLabel });
     } catch { /* non-critical */ }
   }, [dispatch]);
 
@@ -205,8 +207,8 @@ function App() {
 
     setKycLoading(true);
     try {
-      const { data } = await axios.get('/api/compliance/kyc/status');
-      setKycStatus(data.status);
+      const status = await getKycStatus();
+      setKycStatus(status);
       setKycError(null);
     } catch (error) {
       if (error.response?.status === 404) {
@@ -237,7 +239,7 @@ function App() {
   const saveLabel = async () => {
     if (!account) return;
     try {
-      await axios.put(`/api/stellar/account/${account.publicKey}/label`, { accountLabel: labelDraft });
+      await updateAccountLabel(account.publicKey, labelDraft);
       dispatch({ type: A.SET_LABEL, payload: labelDraft });
       setEditingLabel(false);
     } catch (error) {
@@ -248,7 +250,7 @@ function App() {
   const createAccount = useCallback(async () => {
     dispatch({ type: A.SET_LOADING, payload: 'create' });
     try {
-      const { data } = await withTimeout(signal => axios.post('/api/stellar/account/create', null, { signal }));
+      const data = await createStellarAccount();
       dispatch({ type: A.SET_ACCOUNT, payload: data });
       dispatch({ type: A.SET_LABEL, payload: '' });
       resetForm();
@@ -263,7 +265,7 @@ function App() {
   const importAccount = async (secretKey) => {
     dispatch({ type: A.SET_LOADING, payload: 'import' });
     try {
-      const { data } = await withTimeout(signal => axios.post('/api/stellar/account/import', { secretKey }, { signal }));
+      const data = await importStellarAccount(secretKey);
       dispatch({ type: A.SET_ACCOUNT, payload: data });
       dispatch({ type: A.SET_SHOW_IMPORT, payload: false });
       await loadLabel(data.publicKey);
@@ -278,7 +280,7 @@ function App() {
     if (!account) return;
     dispatch({ type: A.SET_LOADING, payload: 'balance' });
     try {
-      const { data } = await withTimeout(signal => axios.get(`/api/stellar/account/${account.publicKey}`, { signal }));
+      const data = await getAccount(account.publicKey);
       dispatch({ type: A.SET_BALANCE, payload: data });
     } catch (error) {
       logError(error, { context: 'checkBalance' });
@@ -325,7 +327,7 @@ function App() {
     }
 
     try {
-      const { data } = await withTimeout(signal => axios.post('/api/stellar/payment/send', payload, { signal }));
+      const data = await sendStellarPayment(payload);
       msg.success(`Payment sent! Hash: ${data.hash.slice(0, 8)}…`, { hash: data.hash });
       resetForm();
       checkBalance();
@@ -730,7 +732,7 @@ function App() {
                           </motion.p>
                         ))}
                       </motion.div>
-                    )}
+                    ) : null}
                   </AnimatePresence>
                 </motion.section>
 
@@ -943,6 +945,7 @@ function App() {
                   <Suspense fallback={<Spinner />}>
                     <AccountRecovery />
                   </Suspense>
+                </motion.div>
                 {/* Settings Sections Tabs */}
                 <motion.section className="section" variants={v.fadeSlide}>
                   <h2 style={{ marginBottom: 16 }}>Advanced Features</h2>
@@ -1110,6 +1113,8 @@ function App() {
             amount={amount}
             estimatedFee="0.00001"
             loading={loading === 'send'}
+          />
+        )}
         {showSettings && account && (
           <AccountSettings
             publicKey={account.publicKey}
@@ -1118,11 +1123,10 @@ function App() {
         )}
 
         {showComplianceDashboard && (
-          <Suspense fallback={<Spinner />}>
-            <ComplianceDashboard onClose={() => setShowComplianceDashboard(false)} />
-          </Suspense>
           <ErrorBoundary context="Compliance Dashboard">
-            <ComplianceDashboard onClose={() => setShowComplianceDashboard(false)} />
+            <Suspense fallback={<Spinner />}>
+              <ComplianceDashboard onClose={() => setShowComplianceDashboard(false)} />
+            </Suspense>
           </ErrorBoundary>
         )}
 
@@ -1131,8 +1135,9 @@ function App() {
             <BackupSettings onClose={() => setShowBackupSettings(false)} />
           </Suspense>
         )}
-      </div>
-    </>
+      </AnimatePresence>
+    </div>
+  </>
   );
 }
 

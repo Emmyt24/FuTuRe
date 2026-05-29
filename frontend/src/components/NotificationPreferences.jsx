@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 import { motion } from 'framer-motion';
 import { FormField } from './FormField';
 import { Spinner } from './Spinner';
@@ -57,7 +57,7 @@ export function NotificationPreferences() {
   const fetchPreferences = useCallback(async () => {
     setLoading(true);
     try {
-      const { data } = await axios.get('/api/notifications/preferences');
+      const { data } = await apiClient.get('/api/notifications/preferences');
       setPreferences({
         email: data.preferences.emailEnabled ?? true,
         push: data.preferences.pushEnabled ?? true,
@@ -91,7 +91,7 @@ export function NotificationPreferences() {
     setError(null);
 
     try {
-      await axios.put('/api/notifications/preferences', {
+      await apiClient.put('/api/notifications/preferences', {
         email: preferences.email,
         push: preferences.push,
         sms: preferences.sms,

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 
 const WEBHOOK_EVENTS = [
   { value: 'payment_sent', label: 'payment_sent' },
@@ -25,7 +25,7 @@ export function WebhookManager({ accountId }) {
     setLoading(true);
     setError('');
     try {
-      const { data } = await axios.get('/api/webhooks', { params: { accountId } });
+      const { data } = await apiClient.get('/api/webhooks', { params: { accountId } });
       setWebhooks(Array.isArray(data) ? data : []);
     } catch (e) {
       setError(e?.response?.data?.error ?? 'Failed to load webhooks');
@@ -55,7 +55,7 @@ export function WebhookManager({ accountId }) {
     setNotice('');
 
     try {
-      await axios.post('/api/webhooks', {
+      await apiClient.post('/api/webhooks', {
         url: url.trim(),
         accountId,
         events: selectedEvents,
@@ -78,7 +78,7 @@ export function WebhookManager({ accountId }) {
     setError('');
     setNotice('');
     try {
-      await axios.delete(`/api/webhooks/${id}`);
+      await apiClient.delete(`/api/webhooks/${id}`);
       setNotice('Webhook deleted.');
       setWebhooks((prev) => prev.filter((w) => w.id !== id));
     } catch (err) {

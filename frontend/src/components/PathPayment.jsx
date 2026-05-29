@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 
 const ASSETS = [
   { code: 'XLM', label: 'XLM (Stellar Lumens)' },
@@ -43,7 +43,7 @@ export function PathPayment({ account }) {
     }
     setFinding(true);
     try {
-      const { data } = await axios.post('/api/path-payment/paths', {
+      const { data } = await apiClient.post('/api/path-payment/paths', {
         sourceAsset: { code: form.sourceAsset },
         sourceAmount: form.sendAmount,
         destinationAsset: { code: form.destAsset },
@@ -64,7 +64,7 @@ export function PathPayment({ account }) {
     setError(null);
     setShowConfirm(false);
     try {
-      const { data } = await axios.post('/api/path-payment/send', {
+      const { data } = await apiClient.post('/api/path-payment/send', {
         sourceSecret: account.secretKey,
         destination: form.destination,
         sendAsset: { code: form.sourceAsset },

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 
 const ASSETS = ['XLM', 'USDC', 'BTC', 'ETH'];
 
@@ -20,7 +20,7 @@ export function ConvertWidget() {
     setError('');
     setResult(null);
     try {
-      const { data } = await axios.get(`/api/stellar/convert/${from}/${to}/${amount}`);
+      const { data } = await apiClient.get(`/api/stellar/convert/${from}/${to}/${amount}`);
       setResult(data);
     } catch (err) {
       setError(err.response?.data?.error ?? err.message);

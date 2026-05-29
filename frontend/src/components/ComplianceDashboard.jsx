@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const SEVERITY_COLORS = {
@@ -25,7 +25,7 @@ export function ComplianceDashboard({ onClose }) {
     setLoading(true);
     setError(null);
     try {
-      const { data } = await axios.get(`/api/compliance/aml/alerts?page=${page}&limit=20`);
+      const { data } = await apiClient.get(`/api/compliance/aml/alerts?page=${page}&limit=20`);
       setAlerts(data.alerts);
       setPagination(data.pagination);
     } catch (err) {
@@ -37,7 +37,7 @@ export function ComplianceDashboard({ onClose }) {
 
   const markAsReviewed = async (alertId) => {
     try {
-      await axios.patch(`/api/compliance/aml/alerts/${alertId}/review`, {
+      await apiClient.patch(`/api/compliance/aml/alerts/${alertId}/review`, {
         notes: reviewNotes,
       });
       setReviewingId(null);
