@@ -24,6 +24,26 @@ jobs:
     - name: Run tests with coverage
       run: npm run test:coverage
 
+    - name: Enforce coverage thresholds
+      run: |
+        node -e "
+          const fs = require('fs');
+          if (!fs.existsSync('./coverage/coverage-summary.json')) {
+            console.error('coverage-summary.json not found');
+            process.exit(1);
+          }
+          const s = require('./coverage/coverage-summary.json').total;
+          const thresholds = { lines: 80, statements: 80, functions: 80, branches: 75 };
+          let failed = false;
+          for (const [key, min] of Object.entries(thresholds)) {
+            const pct = s[key].pct;
+            const status = pct >= min ? 'PASS' : 'FAIL';
+            console.log(\`[\${status}] \${key}: \${pct}% (required: \${min}%)\`);
+            if (pct < min) failed = true;
+          }
+          if (failed) { console.error('Coverage thresholds not met.'); process.exit(1); }
+        "
+
     - name: Upload snapshot artifacts on failure
       uses: actions/upload-artifact@v4
       if: failure()
@@ -47,10 +67,14 @@ jobs:
           echo "## Coverage Summary" >> $GITHUB_STEP_SUMMARY
           node -e "
             const s = require('./coverage/coverage-summary.json').total;
-            console.log('| Metric | Coverage |');
-            console.log('|--------|----------|');
-            ['lines','statements','functions','branches'].forEach(k =>
-              console.log(\`| \${k} | \${s[k].pct}% |\`)
-            );
+            const thresholds = { lines: 80, statements: 80, functions: 80, branches: 75 };
+            console.log('| Metric | Coverage | Threshold | Status |');
+            console.log('|--------|----------|-----------|--------|');
+            ['lines','statements','functions','branches'].forEach(k => {
+              const pct = s[k].pct;
+              const min = thresholds[k];
+              const status = pct >= min ? '✅' : '❌';
+              console.log(\`| \${k} | \${pct}% | \${min}% | \${status} |\`);
+            });
           " >> $GITHUB_STEP_SUMMARY
         fi
