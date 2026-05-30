@@ -1,23 +1,13 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import axios from 'axios';
-
-const TIMEOUT_MS = 30000;
-
-function withTimeout(promiseFn) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  return promiseFn(controller.signal).finally(() => clearTimeout(timer));
-}
+import { getAccount, getTransactions, getExchangeRate, getAccountLabel, updateAccountLabel, sendPayment, createAccount, importAccount, getNetworkStatus } from '../api/stellar.js';
+import { getKycStatus } from '../api/compliance.js';
 
 /**
  * Fetch account balance
  */
 async function fetchBalance(publicKey) {
   if (!publicKey) return null;
-  const { data } = await withTimeout(signal =>
-    axios.get(`/api/stellar/account/${publicKey}`, { signal })
-  );
-  return data;
+  return getAccount(publicKey);
 }
 
 /**
@@ -29,9 +19,9 @@ export function useBalance(publicKey) {
     queryKey: ['balance', publicKey],
     queryFn: () => fetchBalance(publicKey),
     enabled: !!publicKey,
-    staleTime: 30 * 1000, // 30 seconds
-    gcTime: 5 * 60 * 1000, // 5 minutes (formerly cacheTime)
-    refetchInterval: 60 * 1000, // Refetch every 60 seconds
+    staleTime: 30 * 1000,
+    gcTime: 5 * 60 * 1000,
+    refetchInterval: 60 * 1000,
     refetchOnWindowFocus: true,
     refetchOnReconnect: true,
   });
@@ -42,10 +32,7 @@ export function useBalance(publicKey) {
  */
 async function fetchTransactions(publicKey, params) {
   if (!publicKey) return null;
-  const { data } = await withTimeout(signal =>
-    axios.get(`/api/stellar/account/${publicKey}/transactions`, { params, signal })
-  );
-  return data;
+  return getTransactions(publicKey, params);
 }
 
 /**
@@ -57,8 +44,8 @@ export function useTransactions(publicKey, params = {}) {
     queryKey: ['transactions', publicKey, params],
     queryFn: () => fetchTransactions(publicKey, params),
     enabled: !!publicKey,
-    staleTime: 60 * 1000, // 60 seconds
-    gcTime: 10 * 60 * 1000, // 10 minutes
+    staleTime: 60 * 1000,
+    gcTime: 10 * 60 * 1000,
     refetchOnWindowFocus: true,
     refetchOnReconnect: true,
   });
@@ -68,10 +55,7 @@ export function useTransactions(publicKey, params = {}) {
  * Fetch exchange rate
  */
 async function fetchExchangeRate(from, to) {
-  const { data } = await withTimeout(signal =>
-    axios.get(`/api/stellar/exchange-rate/${from}/${to}`, { signal })
-  );
-  return data.rate;
+  return getExchangeRate(from, to);
 }
 
 /**
@@ -82,9 +66,9 @@ export function useExchangeRate(from = 'XLM', to = 'USD') {
   return useQuery({
     queryKey: ['exchangeRate', from, to],
     queryFn: () => fetchExchangeRate(from, to),
-    staleTime: 60 * 1000, // 60 seconds
-    gcTime: 5 * 60 * 1000, // 5 minutes
-    refetchInterval: 60 * 1000, // Refetch every 60 seconds
+    staleTime: 60 * 1000,
+    gcTime: 5 * 60 * 1000,
+    refetchInterval: 60 * 1000,
     refetchOnWindowFocus: true,
     refetchOnReconnect: true,
   });
@@ -95,10 +79,7 @@ export function useExchangeRate(from = 'XLM', to = 'USD') {
  */
 async function fetchKycStatus() {
   try {
-    const { data } = await withTimeout(signal =>
-      axios.get('/api/compliance/kyc/status', { signal })
-    );
-    return data.status;
+    return await getKycStatus();
   } catch (error) {
     if (error.response?.status === 404) {
       return null;
@@ -115,8 +96,8 @@ export function useKycStatus() {
   return useQuery({
     queryKey: ['kycStatus'],
     queryFn: fetchKycStatus,
-    staleTime: 5 * 60 * 1000, // 5 minutes
-    gcTime: 10 * 60 * 1000, // 10 minutes
+    staleTime: 5 * 60 * 1000,
+    gcTime: 10 * 60 * 1000,
     refetchOnWindowFocus: true,
     refetchOnReconnect: true,
   });
@@ -128,10 +109,7 @@ export function useKycStatus() {
 async function fetchAccountLabel(publicKey) {
   if (!publicKey) return '';
   try {
-    const { data } = await withTimeout(signal =>
-      axios.get(`/api/stellar/account/${publicKey}/label`, { signal })
-    );
-    return data.accountLabel || '';
+    return await getAccountLabel(publicKey);
   } catch {
     return '';
   }
@@ -145,8 +123,8 @@ export function useAccountLabel(publicKey) {
     queryKey: ['accountLabel', publicKey],
     queryFn: () => fetchAccountLabel(publicKey),
     enabled: !!publicKey,
-    staleTime: 10 * 60 * 1000, // 10 minutes
-    gcTime: 30 * 60 * 1000, // 30 minutes
+    staleTime: 10 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
   });
 }
 
@@ -157,16 +135,10 @@ export function useSaveAccountLabel() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async ({ publicKey, accountLabel }) => {
-      const { data } = await withTimeout(signal =>
-        axios.put(`/api/stellar/account/${publicKey}/label`, { accountLabel }, { signal })
-      );
-      return data;
+      return updateAccountLabel(publicKey, accountLabel);
     },
-    onSuccess: (data, variables) => {
-      // Invalidate the label query for this account
-      queryClient.invalidateQueries({
-        queryKey: ['accountLabel', variables.publicKey],
-      });
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['accountLabel', variables.publicKey] });
     },
   });
 }
@@ -178,13 +150,9 @@ export function useSendPayment() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (payload) => {
-      const { data } = await withTimeout(signal =>
-        axios.post('/api/stellar/payment/send', payload, { signal })
-      );
-      return data;
+      return sendPayment(payload);
     },
     onSuccess: () => {
-      // Invalidate balance and transactions queries
       queryClient.invalidateQueries({ queryKey: ['balance'] });
       queryClient.invalidateQueries({ queryKey: ['transactions'] });
     },
@@ -198,13 +166,9 @@ export function useCreateAccount() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async () => {
-      const { data } = await withTimeout(signal =>
-        axios.post('/api/stellar/account/create', null, { signal })
-      );
-      return data;
+      return createAccount();
     },
     onSuccess: () => {
-      // Invalidate all account-related queries
       queryClient.invalidateQueries({ queryKey: ['balance'] });
       queryClient.invalidateQueries({ queryKey: ['accountLabel'] });
     },
@@ -218,13 +182,9 @@ export function useImportAccount() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (secretKey) => {
-      const { data } = await withTimeout(signal =>
-        axios.post('/api/stellar/account/import', { secretKey }, { signal })
-      );
-      return data;
+      return importAccount(secretKey);
     },
     onSuccess: () => {
-      // Invalidate all account-related queries
       queryClient.invalidateQueries({ queryKey: ['balance'] });
       queryClient.invalidateQueries({ queryKey: ['accountLabel'] });
     },
@@ -235,10 +195,7 @@ export function useImportAccount() {
  * Fetch network status
  */
 async function fetchNetworkStatus() {
-  const { data } = await withTimeout(signal =>
-    axios.get('/api/stellar/network/status', { signal })
-  );
-  return data;
+  return getNetworkStatus();
 }
 
 /**
@@ -249,9 +206,9 @@ export function useNetworkStatusQuery() {
   return useQuery({
     queryKey: ['networkStatus'],
     queryFn: fetchNetworkStatus,
-    staleTime: 30 * 1000, // 30 seconds
-    gcTime: 5 * 60 * 1000, // 5 minutes
-    refetchInterval: 30 * 1000, // Refetch every 30 seconds
+    staleTime: 30 * 1000,
+    gcTime: 5 * 60 * 1000,
+    refetchInterval: 30 * 1000,
     refetchOnWindowFocus: true,
   });
 }

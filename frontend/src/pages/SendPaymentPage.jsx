@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
 import { motion } from 'framer-motion';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 import { isValidStellarAddress } from '../utils/validateStellarAddress';
 import { validateAmount, formatAmount } from '../utils/validateAmount';
 import { getFriendlyError } from '../utils/errorMessages';
@@ -14,14 +14,7 @@ import { PaymentConfirmationModal } from '../components/PaymentConfirmationModal
 import { LargeTransactionWarning } from '../components/LargeTransactionWarning';
 import { logError } from '../utils/errorLogger';
 
-const TIMEOUT_MS = 30000;
 const KYC_LARGE_TRANSACTION_LIMIT = 1000;
-
-function withTimeout(promiseFn) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  return promiseFn(controller.signal).finally(() => clearTimeout(timer));
-}
 
 export function SendPaymentPage() {
   const { account, balance, loading, recipient, amount, memo, memoType } = useAppState();
@@ -60,16 +53,14 @@ export function SendPaymentPage() {
 
     dispatch({ type: A.SET_LOADING, payload: 'send' });
     try {
-      const { data } = await withTimeout(signal =>
-        axios.post('/api/stellar/payment/send', {
-          sourceSecret: account.secretKey,
-          destination: recipient,
-          amount,
-          assetCode: 'XLM',
-          memo: memo || undefined,
-          memoType: memoType || undefined,
-        }, { signal })
-      );
+      const { data } = await apiClient.post('/api/stellar/payment/send', {
+        sourceSecret: account.secretKey,
+        destination: recipient,
+        amount,
+        assetCode: 'XLM',
+        memo: memo || undefined,
+        memoType: memoType || undefined,
+      });
 
       msg.success(`Payment sent! Hash: ${data.hash?.slice(0, 8)}…`);
       dispatch({ type: A.RESET_FORM });

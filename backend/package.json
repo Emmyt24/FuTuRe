@@ -16,6 +16,13 @@
     "test:integration:all": "vitest run tests/*.integration.test.js"
   },
   "dependencies": {
+    "@opentelemetry/api": "^1.8.0",
+    "@opentelemetry/auto-instrumentations-node": "^1.48.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.50.0",
+    "@opentelemetry/resources": "^0.50.0",
+    "@opentelemetry/sdk-node": "^0.50.0",
+    "@opentelemetry/sdk-trace-node": "^0.50.0",
+    "@opentelemetry/semantic-conventions": "^1.25.0",
     "@prisma/adapter-pg": "^7.5.0",
     "@prisma/client": "^7.5.0",
     "@stellar/stellar-sdk": "^12.3.0",
@@ -34,6 +41,7 @@
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.0",
     "winston": "^3.19.0",
+    "ioredis": "^5.3.2",
     "winston-daily-rotate-file": "^5.0.0",
     "ws": "^8.20.0",
     "zod": "^3.24.4"

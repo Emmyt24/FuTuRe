@@ -629,8 +629,6 @@ router.put('/account/:publicKey/settings',
   }
 );
 
-export default router;
-
 // POST /api/stellar/account/merge - Merge account (irreversible)
 router.post('/account/merge', rules.mergeAccount, validate, async (req, res) => {
   try {
@@ -641,3 +639,5 @@ router.post('/account/merge', rules.mergeAccount, validate, async (req, res) => 
     res.status(500).json({ error: error.message });
   }
 });
+
+export default router;

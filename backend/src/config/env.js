@@ -300,6 +300,9 @@ export function createConfigFromEnv(env, { appEnv, nodeEnv, loadedEnvFiles } = {
     throw new Error('DB_POOL_MAX must be a positive integer');
   }
 
+  const alertEmail = env.ALERT_EMAIL ? (typeof env.ALERT_EMAIL === 'string' ? env.ALERT_EMAIL.trim() : '') : undefined;
+  const slackWebhookUrl = env.SLACK_WEBHOOK_URL ? (typeof env.SLACK_WEBHOOK_URL === 'string' ? env.SLACK_WEBHOOK_URL.trim() : '') : undefined;
+
   return {
     meta: {
       schemaVersion: CONFIG_SCHEMA_VERSION,
@@ -328,6 +331,10 @@ export function createConfigFromEnv(env, { appEnv, nodeEnv, loadedEnvFiles } = {
     },
     database: {
       poolMax: dbPoolMax,
+    },
+    alerts: {
+      email: alertEmail,
+      slackWebhookUrl,
     },
   };
 }

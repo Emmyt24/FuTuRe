@@ -1,7 +1,6 @@
-/**
- * Distributed Tracing
- * Track requests across services
- */
+import { trace } from '@opentelemetry/api';
+
+const tracer = trace.getTracer('future-backend', '1.0.0');
 
 export class DistributedTracer {
   constructor() {
@@ -23,6 +22,14 @@ export class DistributedTracer {
   }
 
   startSpan(traceId, spanId, operationName, serviceName) {
+    const otelSpan = tracer.startSpan(operationName, {
+      attributes: {
+        'service.name': serviceName,
+        'trace.id': traceId,
+        'span.id': spanId,
+      },
+    });
+
     const span = {
       traceId,
       spanId,
@@ -33,6 +40,7 @@ export class DistributedTracer {
       duration: null,
       tags: {},
       logs: [],
+      otelSpan,
     };
 
     this.spans.push(span);
@@ -50,6 +58,9 @@ export class DistributedTracer {
     if (span) {
       span.endTime = Date.now();
       span.duration = span.endTime - span.startTime;
+      if (span.otelSpan) {
+        span.otelSpan.end();
+      }
     }
     return span;
   }
@@ -58,6 +69,9 @@ export class DistributedTracer {
     const span = this.spans.find((s) => s.traceId === traceId && s.spanId === spanId);
     if (span) {
       span.tags[key] = value;
+      if (span.otelSpan) {
+        span.otelSpan.setAttribute(key, value);
+      }
     }
   }
 
@@ -65,6 +79,9 @@ export class DistributedTracer {
     const span = this.spans.find((s) => s.traceId === traceId && s.spanId === spanId);
     if (span) {
       span.logs.push({ timestamp: Date.now(), message });
+      if (span.otelSpan) {
+        span.otelSpan.addEvent('log', { message });
+      }
     }
   }
 
@@ -88,3 +105,5 @@ export class DistributedTracer {
 }
 
 export const createDistributedTracer = () => new DistributedTracer();
+
+export { tracer };

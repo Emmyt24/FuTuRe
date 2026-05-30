@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 
 const STATUS_BADGE = {
   ACTIVE:    { label: 'Active',    color: '#22c55e' },
@@ -31,7 +31,7 @@ export function StreamPayment({ publicKey }) {
   const fetchStreams = useCallback(async () => {
     setLoadingStreams(true);
     try {
-      const { data } = await axios.get('/api/streaming', { params: { senderPublicKey: publicKey } });
+      const { data } = await apiClient.get('/api/streaming', { params: { senderPublicKey: publicKey } });
       setStreams(data);
     } catch (e) {
       setError(e?.response?.data?.error ?? e.message);
@@ -51,7 +51,7 @@ export function StreamPayment({ publicKey }) {
     }
     setCreating(true);
     try {
-      await axios.post('/api/streaming', {
+      await apiClient.post('/api/streaming', {
         senderPublicKey: publicKey,
         recipientPublicKey: form.recipientPublicKey,
         rateAmount: parseFloat(form.rateAmount),
@@ -72,7 +72,7 @@ export function StreamPayment({ publicKey }) {
   const streamAction = async (id, action) => {
     setActionLoading(`${id}-${action}`);
     try {
-      await axios.post(`/api/streaming/${id}/${action}`);
+      await apiClient.post(`/api/streaming/${id}/${action}`);
       fetchStreams();
     } catch (e) {
       setError(e?.response?.data?.error ?? e.message);

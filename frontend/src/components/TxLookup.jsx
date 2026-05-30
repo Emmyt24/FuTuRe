@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { isValidStellarAddress } from '../utils/validateStellarAddress';
@@ -47,7 +47,7 @@ export function TxLookup({ initialHash = '', accountPublicKey = '', onClose }) {
     setError('');
     setTx(null);
     try {
-      const { data } = await axios.get(`/api/stellar/account/${trimPk}/transactions`, {
+      const { data } = await apiClient.get(`/api/stellar/account/${trimPk}/transactions`, {
         params: { hash: trimH, limit: 50 },
       });
       const found = data.records?.find(r => r.hash?.toLowerCase() === trimH.toLowerCase());

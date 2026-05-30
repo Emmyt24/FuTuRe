@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 
 /**
  * Read-only AMM pool browser: lists pools, liquidity, price, and arbitrage opportunities.
@@ -14,7 +14,7 @@ export function AMMPoolBrowser() {
     setLoading(true);
     setError('');
     try {
-      const { data } = await axios.get('/api/stellar/amm/pools');
+      const { data } = await apiClient.get('/api/stellar/amm/pools');
       setPools(data.pools ?? []);
 
       // Detect arbitrage for each unique asset pair
@@ -24,7 +24,7 @@ export function AMMPoolBrowser() {
         const key = [pool.assetA, pool.assetB].sort().join(':');
         if (!pairs.has(key)) {
           pairs.add(key);
-          const res = await axios.get(`/api/stellar/amm/arbitrage/${pool.assetA}/${pool.assetB}`);
+          const res = await apiClient.get(`/api/stellar/amm/arbitrage/${pool.assetA}/${pool.assetB}`);
           opps.push(...(res.data.opportunities ?? []));
         }
       }

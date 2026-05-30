@@ -5,7 +5,15 @@ import { act } from 'react';
 import App from '../src/App';
 
 // Mock dependencies
-vi.mock('axios');
+vi.mock('../src/api/client.js', () => ({
+  default: {
+    get: vi.fn(),
+    post: vi.fn(),
+    put: vi.fn(),
+    patch: vi.fn(),
+    delete: vi.fn(),
+  },
+}));
 vi.mock('framer-motion', () => ({
   motion: {
     div: ({ children, ...props }) => <div {...props}>{children}</div>,

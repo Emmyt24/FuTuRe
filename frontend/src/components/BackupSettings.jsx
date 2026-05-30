@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
@@ -20,7 +20,7 @@ export function BackupSettings({ onClose }) {
     setLoading(true);
     setError(null);
     try {
-      const { data } = await axios.get('/api/backup/status');
+      const { data } = await apiClient.get('/api/backup/status');
       setStatus(data);
     } catch (err) {
       setError(err.response?.data?.error || 'Failed to load backup status');
@@ -31,7 +31,7 @@ export function BackupSettings({ onClose }) {
 
   const loadBackups = async () => {
     try {
-      const { data } = await axios.get('/api/backup');
+      const { data } = await apiClient.get('/api/backup');
       setBackups(data);
     } catch (err) {
       console.error('Failed to load backups:', err);
@@ -42,7 +42,7 @@ export function BackupSettings({ onClose }) {
     setCreating(true);
     setError(null);
     try {
-      await axios.post('/api/backup', { tag: 'manual' });
+      await apiClient.post('/api/backup', { tag: 'manual' });
       await loadStatus();
       await loadBackups();
     } catch (err) {

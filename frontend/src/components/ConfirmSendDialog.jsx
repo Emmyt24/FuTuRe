@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 import { Modal } from '../design-system/Modal';
 import { XLMInfoIcon } from './XLMInfoIcon';
 
@@ -28,7 +28,7 @@ export function ConfirmSendDialog({ open, onConfirm, onCancel, recipient, amount
     if (!open) return;
 
     if (!cache.current.fee) {
-      axios.get('/api/stellar/fee-stats')
+      apiClient.get('/api/stellar/fee-stats')
         .then(({ data }) => { cache.current.fee = data; setFee(data); })
         .catch(() => {});
     } else {
@@ -36,7 +36,7 @@ export function ConfirmSendDialog({ open, onConfirm, onCancel, recipient, amount
     }
 
     if (!cache.current.rate) {
-      axios.get('/api/stellar/exchange-rate/XLM/USD')
+      apiClient.get('/api/stellar/exchange-rate/XLM/USD')
         .then(({ data }) => { cache.current.rate = data.rate; setUsdRate(data.rate); })
         .catch(() => {});
     } else {

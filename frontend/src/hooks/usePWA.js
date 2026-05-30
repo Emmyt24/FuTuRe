@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import axios from 'axios';
+import { subscribePushNotification } from '../api/stellar.js';
 
 /**
  * Handles service worker registration, install prompt, update detection,
@@ -71,7 +71,7 @@ export function usePWA() {
         ),
       });
 
-      await axios.post('/api/notifications/push/subscribe', { subscription, publicKey });
+      await subscribePushNotification({ subscription, publicKey });
       setPushEnabled(true);
     } catch (err) {
       console.error('Push subscription failed:', err);

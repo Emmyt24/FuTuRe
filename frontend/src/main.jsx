@@ -1,3 +1,9 @@
+import { initSentry } from './utils/errorLogger';
+// Validate required environment variables before anything else renders.
+// In production this throws immediately if VITE_API_URL (or any other required
+// var) is missing, preventing a silently broken deployment.
+import './env.js';
+
 import React, { lazy, Suspense } from 'react';
 import ReactDOM from 'react-dom/client';
 import { QueryClientProvider } from '@tanstack/react-query';
@@ -5,9 +11,11 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { initWebVitals } from './utils/webVitals';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { AppStateProvider } from './store/index.js';
-import './utils/axiosConfig.js'; // Initialize axios with API v1 base URL
 import { queryClient } from './config/queryClient';
 import './index.css';
+
+// Initialize error tracking first
+initSentry();
 
 // Lazy-load App for code splitting
 const App = lazy(() => import('./App'));

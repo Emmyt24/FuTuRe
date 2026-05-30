@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 
 const TOOLTIP = `Stellar charges a small network fee per transaction (base fee × operations). `
   + `The fee is burned and not collected by any party. `
@@ -13,7 +13,7 @@ export function FeeDisplay({ amount, visible }) {
   useEffect(() => {
     if (!visible) return;
     if (cache.current) { setFee(cache.current); return; }
-    axios.get('/api/stellar/fee-stats')
+    apiClient.get('/api/stellar/fee-stats')
       .then(({ data }) => { cache.current = data; setFee(data); })
       .catch(() => {});
   }, [visible]);

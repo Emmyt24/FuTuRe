@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 import { FormField } from './FormField';
 import { Spinner } from './Spinner';
 import { StatusMessage } from './StatusMessage';
@@ -44,7 +44,7 @@ export function KYCForm() {
   const fetchKycStatus = useCallback(async () => {
     setStatusLoading(true);
     try {
-      const { data } = await axios.get('/api/compliance/kyc/status');
+      const { data } = await apiClient.get('/api/compliance/kyc/status');
       setKycStatus(data.status);
       setStep('status');
     } catch (e) {
@@ -120,7 +120,7 @@ export function KYCForm() {
 
     setLoading(true);
     try {
-      const response = await axios.post('/api/compliance/kyc', {
+      const response = await apiClient.post('/api/compliance/kyc', {
         fullName: form.fullName,
         dateOfBirth: form.dateOfBirth,
         nationality: form.nationality,

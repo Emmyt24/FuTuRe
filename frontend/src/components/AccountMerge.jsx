@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import axios from 'axios';
+import apiClient from '../api/client.js';
 
 const STELLAR_PUBLIC_KEY = /^G[A-Z2-7]{55}$/;
 
@@ -19,7 +19,7 @@ export function AccountMerge({ sourceSecret, onClose, onSuccess }) {
     setError(null);
 
     try {
-      const { data } = await axios.post('/api/stellar/account/merge', {
+      const { data } = await apiClient.post('/api/stellar/account/merge', {
         sourceSecret,
         destination,
       });

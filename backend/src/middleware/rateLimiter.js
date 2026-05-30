@@ -34,11 +34,9 @@ function createRateLimiter(options = {}) {
     keyGenerator: (req) => getClientIP(req),
     handler: (req, res, next, options) => {
       const clientIP = getClientIP(req);
-      logger.warn({
       const username = req.body?.username || 'unknown';
-      
-      // Log rate-limit hits with username (not password)
-      rateLimitLogger.warn({
+
+      logger.warn({
         ip: clientIP,
         path: req.path,
         method: req.method,
