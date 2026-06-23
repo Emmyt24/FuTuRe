@@ -77,17 +77,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: npm audit
+      - name: npm audit (root workspace)
         run: npm audit --audit-level=high
-        continue-on-error: true
 
-      - name: Upload audit results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: npm-audit-${{ github.sha }}
-          path: npm-audit.json
-          retention-days: 30
+      - name: npm audit (backend)
+        run: npm audit --audit-level=high
+        working-directory: backend
+
+      - name: npm audit (frontend)
+        run: npm audit --audit-level=high
+        working-directory: frontend
 
   security-gate:
     name: Security Gate
@@ -103,6 +102,10 @@ jobs:
           fi
           if [ "${{ needs.sast.result }}" != "success" ]; then
             echo "❌ SAST stage failed"
+            exit 1
+          fi
+          if [ "${{ needs.dependency-scan.result }}" != "success" ]; then
+            echo "❌ Dependency scan stage failed"
             exit 1
           fi
           echo "✅ Security gate passed"

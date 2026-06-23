@@ -264,3 +264,47 @@ Before starting:
 1. Comment on the issue to let others know you are working on it.
 2. Ask any clarifying questions in the issue thread before writing code.
 3. Keep the PR focused on the acceptance criteria — avoid unrelated refactors.
+
+---
+
+## Dependency Vulnerability Management
+
+### Automated scanning
+
+`npm audit --audit-level=high` runs as a blocking CI step in both `test.yml` and `security-pipeline.yml` (covering the root workspace, `backend/`, and `frontend/`). A PR cannot merge if any **high** or **critical** vulnerability is present in the dependency tree.
+
+Dependabot is configured (`.github/dependabot.yml`) to open weekly PRs for outdated packages across all three npm contexts and for GitHub Actions. These PRs are labelled `dependencies` and follow the normal review process.
+
+### Reviewing a vulnerability alert
+
+1. Run `npm audit` locally to read the full advisory:
+   ```bash
+   npm audit
+   cd backend && npm audit
+   cd frontend && npm audit
+   ```
+2. Check the advisory severity, affected versions, and whether a patched version exists.
+3. If a fix is available, update:
+   ```bash
+   npm audit fix                  # safe semver-compatible fixes
+   npm audit fix --force          # major-version bumps (review breaking changes first)
+   ```
+4. If no upstream fix exists yet, assess exploitability in context. If the vulnerable code path is not reachable (e.g., a dev-only package never executed in production), document the exception in a comment on the advisory issue and set a reminder to re-evaluate in 30 days.
+
+### Applying a security patch
+
+1. Create a branch: `chore/fix-<package>-vuln`.
+2. Update the dependency and run the full test suite:
+   ```bash
+   npm run test:coverage
+   npm audit --audit-level=high
+   ```
+3. Open a PR with the advisory ID in the description (e.g., `Fixes GHSA-xxxx-xxxx-xxxx`).
+4. Request review from at least one maintainer — security patches are treated as priority reviews.
+5. Merge as soon as approved; do not batch security fixes with unrelated changes.
+
+### Accepting a Dependabot PR
+
+- Check the changelog / release notes for breaking changes before approving.
+- Run `npm run test:coverage` against the branch locally if the package is a critical runtime dependency.
+- If the update introduces a breaking change that cannot be resolved immediately, close the PR with a comment explaining the blocker and open a tracking issue.
