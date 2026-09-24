@@ -1,0 +1,88 @@
+import { defineConfig, devices } from '@playwright/test';
+
+/**
+ * Playwright configuration for FuTuRe E2E tests
+ * @see https://playwright.dev/docs/test-configuration
+ */
+export default defineConfig({
+  testDir: './tests',
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+  workers: process.env.CI ? 1 : undefined,
+  reporter: [
+    ['html', { outputFolder: 'test-reports/html' }],
+    ['json', { outputFile: 'test-reports/results.json' }],
+    ['junit', { outputFile: 'test-reports/junit.xml' }],
+    ['list'],
+  ],
+  use: {
+    baseURL: process.env.BASE_URL || 'http://localhost:3000',
+    trace: 'on-first-retry',
+    screenshot: 'only-on-failure',
+    video: 'retain-on-failure',
+    actionTimeout: 10000,
+    navigationTimeout: 30000,
+  },
+
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'firefox',
+      use: { ...devices['Desktop Firefox'] },
+    },
+    {
+      name: 'webkit',
+      use: { ...devices['Desktop Safari'] },
+    },
+    // Mobile Chrome (Android) — Pixel 5 profile
+    {
+      name: 'mobile-chrome',
+      use: {
+        ...devices['Pixel 5'],
+        hasTouch: true,
+      },
+      grep: /@mobile/,
+    },
+    // Mobile Safari (iOS) — iPhone 12 profile
+    {
+      name: 'mobile-safari',
+      use: {
+        ...devices['iPhone 12'],
+        hasTouch: true,
+      },
+      grep: /@mobile/,
+    },
+    // iPad (iOS tablet)
+    {
+      name: 'mobile-safari-ipad',
+      use: {
+        ...devices['iPad Pro'],
+        hasTouch: true,
+      },
+      grep: /@mobile/,
+    },
+    {
+      name: 'visual-regression',
+      use: { ...devices['Desktop Chrome'] },
+      grep: /@visual/,
+      snapshotPathTemplate: '{testDir}/visual-baselines/{testFileDir}/{testFileName}-{platform}{ext}',
+      expect: {
+        toHaveScreenshot: {
+          threshold: 0.2,
+          maxDiffPixels: 100,
+        },
+      },
+    },
+  ],
+
+  webServer: {
+    command: 'npm run dev',
+    url: 'http://localhost:3000',
+    reuseExistingServer: !process.env.CI,
+    timeout: 120000,
+  },
+});

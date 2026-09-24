@@ -1,0 +1,282 @@
+import { useState, useCallback, useEffect } from 'react';
+import { motion } from 'framer-motion';
+import apiClient from '../api/client.js';
+import { getFriendlyError } from '../utils/errorMessages';
+import { formatBalanceWithAsset } from '../utils/formatBalance';
+import { useAppState, useAppDispatch, A } from '../store/index.js';
+import { useMessages } from '../hooks/useMessages';
+import { makeVariants } from '../utils/animations';
+import { useReducedMotion } from 'framer-motion';
+import { useCountUp } from '../hooks/useCountUp';
+import { CopyButton } from '../components/CopyButton';
+import { QRCodeModal } from '../components/QRCodeModal';
+import { FeeDisplay } from '../components/FeeDisplay';
+import { PullToRefresh } from '../components/PullToRefresh';
+import { NotificationPermissionManager } from '../components/NotificationPermissionManager';
+import { ClaimableBalances } from '../components/ClaimableBalances';
+import { CreateClaimableBalance } from '../components/CreateClaimableBalance';
+import { BackupReminderBanner } from '../components/BackupReminderBanner';
+import { BackupSettings } from '../components/BackupSettings';
+import { useBackupReminder } from '../hooks/useBackupReminder';
+import { logError } from '../utils/errorLogger';
+
+function AnimatedBalance({ balance, asset }) {
+  const animated = useCountUp(balance);
+  return <span>{formatBalanceWithAsset(animated, asset)}</span>;
+}
+
+export function AccountDashboardPage() {
+  const { account, balance, loading, accountLabel } = useAppState();
+  const dispatch = useAppDispatch();
+  const msg = useMessages();
+
+  const [showQR, setShowQR] = useState(false);
+  const [editingLabel, setEditingLabel] = useState(false);
+  const [labelDraft, setLabelDraft] = useState(accountLabel || '');
+  const [transactionCount, setTransactionCount] = useState(null);
+  const [showBackupSettings, setShowBackupSettings] = useState(false);
+  // Bumping this forces a re-render so useBackupReminder re-reads localStorage
+  // after a dismiss/backup/verification, none of which otherwise touch React state.
+  const [, setReminderTick] = useState(0);
+
+  const prefersReduced = useReducedMotion();
+  const v = makeVariants(prefersReduced);
+
+  const { showReminder, threshold, transactionsSinceBackup, dismiss } = useBackupReminder(transactionCount);
+
+  useEffect(() => {
+    setLabelDraft(accountLabel || '');
+  }, [accountLabel]);
+
+  useEffect(() => {
+    if (!account?.publicKey) {
+      setTransactionCount(null);
+      return;
+    }
+    let cancelled = false;
+    apiClient
+      .get(`/api/stellar/account/${account.publicKey}/transactions`, { params: { limit: 100 } })
+      .then(({ data }) => {
+        if (!cancelled) setTransactionCount(data?.records?.length ?? 0);
+      })
+      .catch(() => {
+        if (!cancelled) setTransactionCount(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [account?.publicKey]);
+
+  const checkBalance = useCallback(async () => {
+    if (!account) return;
+    if (!navigator.onLine) {
+      msg.info('You are offline — showing cached balance.');
+      return;
+    }
+    dispatch({ type: A.SET_LOADING, payload: 'balance' });
+    try {
+      const { data } = await apiClient.get(`/api/stellar/account/${account.publicKey}`);
+      dispatch({ type: A.SET_BALANCE, payload: data });
+    } catch (error) {
+      logError(error, { context: 'checkBalance' });
+      msg.error(getFriendlyError(error), { retry: checkBalance });
+    } finally {
+      dispatch({ type: A.SET_LOADING, payload: '' });
+    }
+  }, [account, dispatch, msg]);
+
+  const saveLabel = async () => {
+    if (!account) return;
+    try {
+      await apiClient.put(`/api/stellar/account/${account.publicKey}/label`, { accountLabel: labelDraft });
+      dispatch({ type: A.SET_LABEL, payload: labelDraft });
+      setEditingLabel(false);
+    } catch (error) {
+      msg.error('Failed to save label');
+    }
+  };
+
+  if (!account) {
+    return (
+      <motion.section className="section" variants={v.fadeSlide}>
+        <p>No account loaded. Create or import an account to get started.</p>
+      </motion.section>
+    );
+  }
+
+  return (
+    <PullToRefresh onRefresh={checkBalance}>
+      <motion.section className="section" variants={v.fadeSlide}>
+        <h2>Account Dashboard</h2>
+
+        <div style={{ marginBottom: 20, padding: 16, background: '#f9fafb', borderRadius: 8 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <h3 style={{ margin: 0 }}>Account</h3>
+            <button
+              type="button"
+              onClick={() => setShowQR(true)}
+              style={{ padding: '6px 12px', background: '#0066cc', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}
+            >
+              📱 Show QR
+            </button>
+    <motion.section className="section" variants={v.fadeSlide}>
+      <h2>Account Dashboard</h2>
+
+      {showReminder && (
+        <BackupReminderBanner
+          transactionsSinceBackup={transactionsSinceBackup}
+          threshold={threshold}
+          onBackupNow={() => setShowBackupSettings(true)}
+          onDismiss={() => {
+            dismiss();
+            setReminderTick((t) => t + 1);
+          }}
+        />
+      )}
+
+      <div style={{ marginBottom: 20, padding: 16, background: '#f9fafb', borderRadius: 8 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+          <h3 style={{ margin: 0 }}>Account</h3>
+          <button
+            type="button"
+            onClick={() => setShowQR(true)}
+            style={{ padding: '6px 12px', background: '#0066cc', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}
+          >
+            📱 Show QR
+          </button>
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ display: 'block', fontSize: 12, color: '#666', marginBottom: 4 }}>Public Key</label>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <code style={{ flex: 1, padding: 8, background: '#fff', border: '1px solid #d1d5db', borderRadius: 4, fontSize: 12, wordBreak: 'break-all' }}>
+              {account.publicKey}
+            </code>
+            <CopyButton text={account.publicKey} />
+          </div>
+
+          <div style={{ marginBottom: 12 }}>
+            <label style={{ display: 'block', fontSize: 12, color: '#666', marginBottom: 4 }}>Public Key</label>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <code style={{ flex: 1, padding: 8, background: '#fff', border: '1px solid #d1d5db', borderRadius: 4, fontSize: 12, wordBreak: 'break-all' }}>
+                {account.publicKey}
+              </code>
+              <CopyButton text={account.publicKey} />
+            </div>
+          </div>
+
+          <div>
+            <label style={{ display: 'block', fontSize: 12, color: '#666', marginBottom: 4 }}>Label</label>
+            {editingLabel ? (
+              <div style={{ display: 'flex', gap: 8 }}>
+                <label htmlFor="account-label-edit" className="sr-only">Account label</label>
+                <input
+                  id="account-label-edit"
+                  type="text"
+                  aria-label="Account label"
+                  value={labelDraft}
+                  onChange={(e) => setLabelDraft(e.target.value)}
+                  style={{ flex: 1, padding: '8px 12px', border: '1px solid #d1d5db', borderRadius: 4 }}
+                />
+                <button
+                  type="button"
+                  onClick={saveLabel}
+                  style={{ padding: '8px 16px', background: '#10b981', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer' }}
+                >
+                  Save
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEditingLabel(false)}
+                  style={{ padding: '8px 16px', background: '#6b7280', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer' }}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <span style={{ flex: 1, padding: '8px 12px', background: '#fff', border: '1px solid #d1d5db', borderRadius: 4 }}>
+                  {accountLabel || '(no label)'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setEditingLabel(true)}
+                  style={{ padding: '8px 16px', background: '#0066cc', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer' }}
+                >
+                  Edit
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <NotificationPermissionManager
+          publicKey={account.publicKey}
+          onStatusChange={(status) => {
+            // Handle status change if needed
+          }}
+        />
+
+        <div style={{ marginBottom: 20, padding: 16, background: '#f9fafb', borderRadius: 8 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <h3 style={{ margin: 0 }}>Balance</h3>
+            <button
+              type="button"
+              onClick={checkBalance}
+              disabled={loading === 'balance'}
+              style={{
+                padding: '6px 12px',
+                background: loading === 'balance' ? '#d1d5db' : '#0066cc',
+                color: '#fff',
+                border: 'none',
+                borderRadius: 4,
+                cursor: loading === 'balance' ? 'not-allowed' : 'pointer',
+                fontSize: 12,
+              }}
+            >
+              {loading === 'balance' ? 'Refreshing…' : '🔄 Refresh'}
+            </button>
+          </div>
+
+          {balance?.balances && balance.balances.length > 0 ? (
+            <div>
+              {balance.balances.map((b, i) => (
+                <div key={i} style={{ padding: '8px 0', borderBottom: i < balance.balances.length - 1 ? '1px solid #e5e7eb' : 'none' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ fontWeight: 500 }}>{b.asset}</span>
+                    <AnimatedBalance balance={b.balance} asset={b.asset} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p style={{ color: '#666', fontSize: 14 }}>No balances loaded</p>
+          )}
+        </div>
+
+        <FeeDisplay />
+
+        <CreateClaimableBalance onSuccess={checkBalance} />
+
+        <ClaimableBalances publicKey={account.publicKey} />
+
+        {showQR && account && (
+          <QRCodeModal publicKey={account.publicKey} onClose={() => setShowQR(false)} />
+        )}
+      </motion.section>
+    </PullToRefresh>
+      {showQR && account && (
+        <QRCodeModal publicKey={account.publicKey} onClose={() => setShowQR(false)} />
+      )}
+
+      {showBackupSettings && (
+        <BackupSettings
+          onClose={() => {
+            setShowBackupSettings(false);
+            setReminderTick((t) => t + 1);
+          }}
+        />
+      )}
+    </motion.section>
+  );
+}

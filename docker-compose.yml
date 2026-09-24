@@ -1,0 +1,143 @@
+# docker-compose.yml
+#
+# Resource limits (deploy.resources.limits) below are set for local/production
+# parity and to prevent an unbounded container from starving its siblings or
+# OOM-killing unrelated processes on a shared CI runner or a developer machine:
+#
+#   - backend:  0.5 vCPU / 1024 MiB — intentionally mirrors infra/variables.tf's
+#               backend_cpu (512 CPU units) / backend_memory (1024 MiB) defaults,
+#               which size the production ECS Fargate task in infra/ecs.tf. This
+#               lets memory-pressure bugs surface locally instead of only in prod.
+#   - postgres: 1 vCPU / 1 GiB   — headroom for local dev workloads without being
+#               able to consume the whole host.
+#   - redis:    0.5 vCPU / 512 MiB — cache + rate-limit store; bounded to avoid
+#               unbounded local growth.
+#   - frontend: 0.25 vCPU / 256 MiB — lightweight, just Vite/Nginx serving static
+#               assets.
+#
+# If your environment needs more headroom (e.g. running the full stack plus an
+# IDE and other tooling), raise the relevant `limits` values locally — see
+# CONTRIBUTING.md.
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: future_remittance
+      POSTGRES_USER: future_admin
+      POSTGRES_PASSWORD: dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U future_admin -d future_remittance"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./backend/src:/app/src
+      - ./backend/prisma:/app/prisma
+    deploy:
+      resources:
+        limits:
+          # Mirrors infra/variables.tf backend_cpu/backend_memory defaults
+          # (512 CPU units = 0.5 vCPU, 1024 MiB) so local memory-pressure
+          # behavior matches the production Fargate task.
+          cpus: "0.5"
+          memory: 1024M
+        reservations:
+          cpus: "0.25"
+          memory: 512M
+    environment:
+      APP_ENV: development
+      PORT: 3001
+      TZ: UTC
+      DATABASE_URL: postgresql://future_admin:dev_password@postgres:5432/future_remittance
+      REDIS_URL: redis://redis:6379
+      STELLAR_NETWORK: testnet
+      HORIZON_URL: https://horizon-testnet.stellar.org
+      ALLOWED_ORIGINS: http://localhost:3000
+      JWT_SECRET: dev-jwt-secret-change-me
+      STREAM_SECRET_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      FEE_BUMP_THRESHOLD_XLM: "2"
+      LOG_LEVEL: info
+      CACHE_TTL_BALANCE_S: "30"
+      RATE_CACHE_TTL_S: "60"
+      CACHE_TTL_FEE_S: "120"
+      RATE_LIMIT_WINDOW_MS: "60000"
+      RATE_LIMIT_MAX: "100"
+      DB_POOL_MAX: "10"
+      DB_SHARD_COUNT: "1"
+      CDN_ENABLED: "false"
+    command: sh -c "npx prisma migrate deploy && node --watch src/server.js"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      # Local Vite (Dockerfile.dev) listens on 3000. The production
+      # frontend/Dockerfile nginx runtime listens on 8080 as non-root.
+      - "3000:3000"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - ./frontend/index.html:/app/index.html
+    environment:
+      VITE_API_URL: http://localhost:3001
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+volumes:
+  db_data:
