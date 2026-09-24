@@ -8,9 +8,28 @@ import { processDueWebhookDeliveries } from './webhooks/dispatcher.js';
 import { recordFeeSnapshot, purgeStaleFeeSnapshots } from './services/feeHistory.js';
 import { processSep31StatusPolls } from './services/sep31.js';
 import { refreshAllRates, RATE_REFRESH_INTERVAL_MS } from './services/exchangeRate.js';
+import { syncSanctionsList } from './compliance/sanctionsSync.js';
 import { drainAmlAlertDlq } from './compliance/amlMonitor.js';
 
 let intervals = [];
+
+// Milliseconds until the next 04:00 UTC occurrence.
+function msUntilNextUtcHour(hour) {
+  const now = new Date();
+  const next = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    hour,
+    0,
+    0,
+    0,
+  ));
+  if (next.getTime() <= now.getTime()) {
+    next.setUTCDate(next.getUTCDate() + 1);
+  }
+  return next.getTime() - now.getTime();
+}
 
 export async function startScheduler() {
   logger.info('scheduler.start');
@@ -145,6 +164,24 @@ export async function startScheduler() {
   }, 24 * 60 * 60 * 1000); // Every 24 hours
   intervals.push(feeSnapshotPurgeInterval);
 
+  // OFAC sanctions list synchronization (#1331) – refresh the SDN list daily
+  // at 04:00 UTC so newly designated individuals, vessels, and crypto
+  // addresses become active without a redeploy. The first run is scheduled
+  // for the next 04:00 UTC boundary; subsequent runs repeat every 24 hours.
+  const runSanctionsSync = async () => {
+    try {
+      const result = await syncSanctionsList();
+      logger.info('scheduler.sanctionsSync.synced', { count: result.synced });
+    } catch (err) {
+      logger.error('scheduler.sanctionsSync.failed', { error: err.message });
+    }
+  };
+  const sanctionsSyncTimeout = setTimeout(() => {
+    runSanctionsSync();
+    const sanctionsSyncInterval = setInterval(runSanctionsSync, 24 * 60 * 60 * 1000);
+    intervals.push(sanctionsSyncInterval);
+  }, msUntilNextUtcHour(4));
+  intervals.push(sanctionsSyncTimeout);
   // AML alert DLQ retry worker (#1329) - drain failed alert records from the
   // Redis DLQ back into PostgreSQL once database connectivity is restored.
   const amlDlqInterval = setInterval(async () => {
@@ -162,6 +199,7 @@ export function stopScheduler() {
   logger.info('scheduler.stop');
   for (const interval of intervals) {
     clearInterval(interval);
+    clearTimeout(interval);
   }
   intervals = [];
 }

@@ -1,4 +1,5 @@
-// Sanctions screening — integrates with the OFAC SDN API.
+// Sanctions screening — integrates with the OFAC SDN API and the locally
+// synchronized SanctionsEntity table (see sanctionsSync.js).
 // Set SANCTIONS_API_KEY and SANCTIONS_API_URL in your environment.
 //
 // Fail mode (SANCTIONS_FAIL_MODE, default 'closed'): when the API is
@@ -13,6 +14,8 @@
 
 import https from 'https';
 import logger from '../config/logger.js';
+import prisma from '../config/prisma.js';
+import redis from '../config/redis.js';
 
 const API_URL  = process.env.SANCTIONS_API_URL  ?? 'https://api.ofac-api.com/v4/search';
 const API_KEY  = process.env.SANCTIONS_API_KEY  ?? '';
@@ -21,6 +24,8 @@ const FAIL_MODE = (process.env.SANCTIONS_FAIL_MODE ?? 'closed').trim().toLowerCa
 const APP_ENV = (process.env.APP_ENV || process.env.NODE_ENV || 'development').trim().toLowerCase();
 const IS_DEPLOYED = APP_ENV === 'production' || APP_ENV === 'staging';
 
+const CACHE_TTL_SECONDS = parseInt(process.env.SANCTIONS_CACHE_TTL ?? '3600', 10);
+const CACHE_PREFIX = 'sanctions:screen:';
 // Similarity threshold above which a fuzzy match is flagged for manual review.
 const FUZZY_THRESHOLD = parseFloat(process.env.SANCTIONS_FUZZY_THRESHOLD ?? '0.85');
 
@@ -299,6 +304,10 @@ function httpPost(url, body, headers) {
   });
 }
 
+function cacheKey(fullName, nationality) {
+  return `${CACHE_PREFIX}${fullName.trim().toLowerCase()}|${(nationality ?? '').trim().toLowerCase()}`;
+}
+
 class SanctionsChecker {
   /**
    * Screen a person against sanctions lists.
@@ -307,6 +316,28 @@ class SanctionsChecker {
    * @returns {Promise<{ hit: boolean, reason?: string, source?: string }>}
    */
   async check(fullName, nationality) {
+    const key = cacheKey(fullName, nationality);
+    try {
+      const cached = await redis.get(key);
+      if (cached) {
+        return JSON.parse(cached);
+      }
+    } catch (err) {
+      sanctionsLogger.warn('sanctions.cache.read_failed', { error: err.message });
+    }
+
+    const result = await this._screen(fullName, nationality);
+
+    try {
+      await redis.set(key, JSON.stringify(result), 'EX', CACHE_TTL_SECONDS);
+    } catch (err) {
+      sanctionsLogger.warn('sanctions.cache.write_failed', { error: err.message });
+    }
+
+    return result;
+  }
+
+  async _screen(fullName, nationality) {
     if (API_KEY) {
       return this._checkViaApi(fullName, nationality);
     }
@@ -326,6 +357,42 @@ class SanctionsChecker {
     // No API key — warn and return clear (operator must configure for production)
     sanctionsLogger.warn('SANCTIONS_API_KEY not set; screening skipped. Configure for production.');
     return { hit: false };
+  }
+
+  /**
+   * Screen a crypto address against the locally synchronized SanctionsEntity
+   * table (populated daily by sanctionsSync.js).
+   * @param {string} address
+   * @returns {Promise<{ hit: boolean, reason?: string, source?: string }>}
+   */
+  async checkCryptoAddress(address) {
+    if (!address) return { hit: false };
+    const normalized = address.trim().toLowerCase();
+    try {
+      const match = await prisma.sanctionsEntity.findFirst({
+        where: { cryptoAddresses: { has: normalized } },
+        select: { name: true, source: true },
+      });
+      if (match) {
+        return {
+          hit: true,
+          reason: `Matched sanctioned crypto address: ${match.name}`,
+          source: match.source ?? 'OFAC',
+        };
+      }
+      return { hit: false };
+    } catch (err) {
+      logger.error('sanctions.crypto.lookup_failed', { error: err.message, appEnv: APP_ENV, failMode: FAIL_MODE });
+      if (FAIL_MODE === 'closed') {
+        return {
+          hit: true,
+          reason: `Sanctions database unavailable (${err.message}) — blocking pending manual review`,
+          source: 'SCREENING_ERROR',
+          screeningError: true,
+        };
+      }
+      return { hit: false, warning: `Sanctions database unavailable: ${err.message}` };
+    }
   }
 
   async _checkViaApi(fullName, nationality) {
