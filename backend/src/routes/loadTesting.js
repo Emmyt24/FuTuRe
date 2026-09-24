@@ -9,19 +9,70 @@ import {
   performanceAlerting,
   optimizationRecommender
 } from '../loadTesting/index.js';
+import { requireAdmin } from '../middleware/adminAuth.js';
+import { validateWebhookUrl } from '../webhooks/urlValidator.js';
 
 const router = express.Router();
 
-// Scenario endpoints
+// Load tests can flood an arbitrary target and are only meant for internal
+// performance engineering, so every route here requires admin auth (#1100, #1102).
+router.use(requireAdmin);
+
+const MAX_CONCURRENCY = 200;
+const MAX_DURATION_SECONDS = 600;
+
+/**
+ * @swagger
+ * /api/load-testing/scenarios/create:
+ *   post:
+ *     summary: Create a load test scenario
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
+ *     tags: [LoadTesting]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [name]
+ *             properties:
+ *               name: { type: string }
+ *               description: { type: string }
+ *               requests:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *                   properties:
+ *                     method: { type: string }
+ *                     path: { type: string }
+ *                     body: { type: object }
+ *                     weight: { type: number }
+ *               duration: { type: integer, description: Duration in ms }
+ *               rampUp: { type: integer }
+ *               concurrency: { type: integer }
+ *     responses:
+ *       200:
+ *         description: Scenario created
+ *       500:
+ *         description: Server error
+ */
 router.post('/scenarios/create', async (req, res) => {
   try {
     const { name, description, requests, duration, rampUp, concurrency } = req.body;
-    const scenario = new LoadTestScenario(name, description);
-    
-    for (const req of requests) {
-      scenario.addRequest(req.method, req.path, req.body, req.weight);
+
+    if (concurrency > MAX_CONCURRENCY) {
+      return res.status(400).json({ error: `concurrency must not exceed ${MAX_CONCURRENCY}` });
     }
-    
+    if (duration > MAX_DURATION_SECONDS) {
+      return res.status(400).json({ error: `duration must not exceed ${MAX_DURATION_SECONDS} seconds` });
+    }
+
+    const scenario = new LoadTestScenario(name, description);
+
+    for (const reqItem of requests) {
+      scenario.addRequest(reqItem.method, reqItem.path, reqItem.body, reqItem.weight);
+    }
+
     scenario.setDuration(duration).setRampUp(rampUp).setConcurrency(concurrency);
     await scenario.save();
     
@@ -31,14 +82,43 @@ router.post('/scenarios/create', async (req, res) => {
   }
 });
 
-// Load test endpoints
+/**
+ * @swagger
+ * /api/load-testing/run:
+ *   post:
+ *     summary: Run a load test scenario
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
+ *     tags: [LoadTesting]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [scenarioName]
+ *             properties:
+ *               scenarioName: { type: string }
+ *               baseUrl: { type: string, default: 'http://localhost:3001' }
+ *     responses:
+ *       200:
+ *         description: Load test results
+ *       500:
+ *         description: Server error
+ */
 router.post('/run', async (req, res) => {
   try {
     const { scenarioName, baseUrl } = req.body;
+    const targetUrl = baseUrl || 'http://localhost:3001';
+
+    const { valid, error } = await validateWebhookUrl(targetUrl);
+    if (!valid) {
+      return res.status(400).json({ error: `Invalid baseUrl: ${error}` });
+    }
+
     const scenario = await LoadTestScenario.load(scenarioName);
     const runner = new LoadTestRunner();
-    
-    const results = await runner.runScenario(scenario, baseUrl || 'http://localhost:3001');
+
+    const results = await runner.runScenario(scenario, targetUrl);
     const saved = await runner.saveResults(scenarioName);
     
     res.json(saved);
@@ -47,6 +127,27 @@ router.post('/run', async (req, res) => {
   }
 });
 
+/**
+ * @swagger
+ * /api/load-testing/results/{scenarioName}:
+ *   get:
+ *     summary: Get latest load test results for a scenario
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
+ *     tags: [LoadTesting]
+ *     parameters:
+ *       - in: path
+ *         name: scenarioName
+ *         required: true
+ *         schema: { type: string }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 10 }
+ *     responses:
+ *       200:
+ *         description: Test results
+ *       500:
+ *         description: Server error
+ */
 router.get('/results/:scenarioName', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 10;
@@ -57,7 +158,30 @@ router.get('/results/:scenarioName', async (req, res) => {
   }
 });
 
-// Baseline endpoints
+/**
+ * @swagger
+ * /api/load-testing/baseline/establish:
+ *   post:
+ *     summary: Establish a performance baseline from latest results
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
+ *     tags: [LoadTesting]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [scenarioName]
+ *             properties:
+ *               scenarioName: { type: string }
+ *     responses:
+ *       200:
+ *         description: Baseline established
+ *       400:
+ *         description: No test results found
+ *       500:
+ *         description: Server error
+ */
 router.post('/baseline/establish', async (req, res) => {
   try {
     const { scenarioName } = req.body;
@@ -77,6 +201,24 @@ router.post('/baseline/establish', async (req, res) => {
   }
 });
 
+/**
+ * @swagger
+ * /api/load-testing/baseline/latest/{scenarioName}:
+ *   get:
+ *     summary: Get the latest performance baseline for a scenario
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
+ *     tags: [LoadTesting]
+ *     parameters:
+ *       - in: path
+ *         name: scenarioName
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Latest baseline
+ *       500:
+ *         description: Server error
+ */
 router.get('/baseline/latest/:scenarioName', async (req, res) => {
   try {
     const baseline = await PerformanceBaseline.getLatest(req.params.scenarioName);
@@ -86,7 +228,30 @@ router.get('/baseline/latest/:scenarioName', async (req, res) => {
   }
 });
 
-// Regression testing endpoints
+/**
+ * @swagger
+ * /api/load-testing/regression/check:
+ *   post:
+ *     summary: Check for performance regressions against baseline
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
+ *     tags: [LoadTesting]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [scenarioName]
+ *             properties:
+ *               scenarioName: { type: string }
+ *     responses:
+ *       200:
+ *         description: Regression report
+ *       400:
+ *         description: Missing baseline or results
+ *       500:
+ *         description: Server error
+ */
 router.post('/regression/check', async (req, res) => {
   try {
     const { scenarioName } = req.body;
@@ -106,7 +271,30 @@ router.post('/regression/check', async (req, res) => {
   }
 });
 
-// Bottleneck analysis endpoints
+/**
+ * @swagger
+ * /api/load-testing/bottlenecks/analyze:
+ *   post:
+ *     summary: Analyze bottlenecks from latest test results
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
+ *     tags: [LoadTesting]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [scenarioName]
+ *             properties:
+ *               scenarioName: { type: string }
+ *     responses:
+ *       200:
+ *         description: Bottlenecks and recommendations
+ *       400:
+ *         description: No test results found
+ *       500:
+ *         description: Server error
+ */
 router.post('/bottlenecks/analyze', async (req, res) => {
   try {
     const { scenarioName } = req.body;
@@ -125,7 +313,31 @@ router.post('/bottlenecks/analyze', async (req, res) => {
   }
 });
 
-// Capacity planning endpoints
+/**
+ * @swagger
+ * /api/load-testing/capacity/calculate:
+ *   post:
+ *     summary: Calculate current capacity from test results
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
+ *     tags: [LoadTesting]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [scenarioName]
+ *             properties:
+ *               scenarioName: { type: string }
+ *               targetErrorRate: { type: number, default: 1 }
+ *     responses:
+ *       200:
+ *         description: Capacity data
+ *       400:
+ *         description: No test results found
+ *       500:
+ *         description: Server error
+ */
 router.post('/capacity/calculate', async (req, res) => {
   try {
     const { scenarioName, targetErrorRate } = req.body;
@@ -142,6 +354,32 @@ router.post('/capacity/calculate', async (req, res) => {
   }
 });
 
+/**
+ * @swagger
+ * /api/load-testing/capacity/project:
+ *   post:
+ *     summary: Project future capacity needs based on growth rate
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
+ *     tags: [LoadTesting]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [scenarioName, growthRate, months]
+ *             properties:
+ *               scenarioName: { type: string }
+ *               growthRate: { type: number, description: Monthly growth rate as decimal }
+ *               months: { type: integer }
+ *     responses:
+ *       200:
+ *         description: Capacity projection
+ *       400:
+ *         description: No test results found
+ *       500:
+ *         description: Server error
+ */
 router.post('/capacity/project', async (req, res) => {
   try {
     const { scenarioName, growthRate, months } = req.body;
@@ -162,7 +400,30 @@ router.post('/capacity/project', async (req, res) => {
   }
 });
 
-// Performance alerting endpoints
+/**
+ * @swagger
+ * /api/load-testing/alerts/check:
+ *   post:
+ *     summary: Check performance metrics against alert thresholds
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
+ *     tags: [LoadTesting]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [scenarioName]
+ *             properties:
+ *               scenarioName: { type: string }
+ *     responses:
+ *       200:
+ *         description: Alerts triggered
+ *       400:
+ *         description: No test results found
+ *       500:
+ *         description: Server error
+ */
 router.post('/alerts/check', async (req, res) => {
   try {
     const { scenarioName } = req.body;
@@ -181,6 +442,23 @@ router.post('/alerts/check', async (req, res) => {
   }
 });
 
+/**
+ * @swagger
+ * /api/load-testing/alerts:
+ *   get:
+ *     summary: Get performance alerts
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
+ *     tags: [LoadTesting]
+ *     parameters:
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 100 }
+ *     responses:
+ *       200:
+ *         description: Performance alerts
+ *       500:
+ *         description: Server error
+ */
 router.get('/alerts', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
@@ -191,6 +469,19 @@ router.get('/alerts', async (req, res) => {
   }
 });
 
+/**
+ * @swagger
+ * /api/load-testing/alerts/critical:
+ *   get:
+ *     summary: Get critical performance alerts
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
+ *     tags: [LoadTesting]
+ *     responses:
+ *       200:
+ *         description: Critical alerts
+ *       500:
+ *         description: Server error
+ */
 router.get('/alerts/critical', async (req, res) => {
   try {
     const alerts = await performanceAlerting.constructor.getCriticalAlerts();
@@ -200,7 +491,30 @@ router.get('/alerts/critical', async (req, res) => {
   }
 });
 
-// Optimization recommendations endpoints
+/**
+ * @swagger
+ * /api/load-testing/recommendations:
+ *   post:
+ *     summary: Get optimization recommendations from test results
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
+ *     tags: [LoadTesting]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [scenarioName]
+ *             properties:
+ *               scenarioName: { type: string }
+ *     responses:
+ *       200:
+ *         description: Prioritized recommendations
+ *       400:
+ *         description: No test results found
+ *       500:
+ *         description: Server error
+ */
 router.post('/recommendations', async (req, res) => {
   try {
     const { scenarioName } = req.body;

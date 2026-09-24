@@ -1,15 +1,16 @@
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { isWhitelisted } from '../security/ipWhitelist.js';
-import { logger } from '../utils/logger.js';
-
-export const rateLimitLogger = logger.child({ component: 'rateLimiter' });
+import logger from '../config/logger.js';
 
 function getClientIP(req) {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (forwarded) {
-    return forwarded.split(',')[0].trim();
-  }
-  return req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress;
+  // req.ip is derived by Express from X-Forwarded-For only up to the
+  // trusted hop count configured via `app.set('trust proxy', ...)`
+  // (TRUST_PROXY_HOPS), so it can't be spoofed by a direct caller.
+  return req.ip || req.socket?.remoteAddress || req.connection?.remoteAddress;
+}
+
+function getUserRateLimitKey(req) {
+  return req.user?.id || req.user?.userId || req.user?.sub || req.user?.publicKey || null;
 }
 
 function createRateLimiter(options = {}) {
@@ -20,6 +21,7 @@ function createRateLimiter(options = {}) {
     standardHeaders = true,
     legacyHeaders = false,
     skip = (req) => isWhitelisted(getClientIP(req)),
+    keyGenerator = (req) => ipKeyGenerator(getClientIP(req)),
   } = options;
 
   const limiter = rateLimit({
@@ -33,19 +35,27 @@ function createRateLimiter(options = {}) {
     standardHeaders,
     legacyHeaders,
     skip,
-    keyGenerator: (req) => getClientIP(req),
-    handler: (req, res, next, options) => {
+    keyGenerator,
+    handler: (req, res, _next, opts) => {
       const clientIP = getClientIP(req);
-      rateLimitLogger.warn({
+      const username = req.body?.username || 'unknown';
+
+      logger.warn({
         ip: clientIP,
+        userId: getUserRateLimitKey(req),
         path: req.path,
         method: req.method,
+        username,
         whitelist: isWhitelisted(clientIP),
       }, 'Rate limit exceeded');
+      
+      const retryAfter = Math.ceil(windowMs / 1000);
+      res.set('Retry-After', retryAfter.toString());
+      
       res.status(429).json({
-        error: options.message.error || message,
+        error: opts.message.error || message,
         statusCode: 429,
-        retryAfter: options.message.retryAfter || Math.ceil(windowMs / 1000),
+        retryAfter,
       });
     },
   });
@@ -53,16 +63,15 @@ function createRateLimiter(options = {}) {
   return limiter;
 }
 
-function rateLimiter(req, res, next) {
-  const clientIP = getClientIP(req);
-  
-  if (isWhitelisted(clientIP)) {
-    return next();
-  }
-  
-  return createRateLimiter()(req, res, next);
+function createPerUserRateLimiter(options = {}) {
+  return createRateLimiter({
+    ...options,
+    keyGenerator: (req) => getUserRateLimitKey(req) || ipKeyGenerator(getClientIP(req)),
+  });
 }
 
-export { createRateLimiter, getClientIP };
+const rateLimiter = createRateLimiter();
+
+export { createRateLimiter, createPerUserRateLimiter, getClientIP, getUserRateLimitKey };
 
 export default rateLimiter;

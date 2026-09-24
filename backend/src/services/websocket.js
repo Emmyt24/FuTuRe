@@ -1,58 +1,322 @@
 import { WebSocketServer, WebSocket } from 'ws';
+import { createHmac, randomBytes } from 'crypto';
+import jwt from 'jsonwebtoken';
+import logger from '../config/logger.js';
+import { registerMetricProvider } from '../monitoring/metrics.js';
 
+// ── Config ────────────────────────────────────────────────────────────────────
+const MAX_CONNECTIONS_PER_KEY = 5;
+const MAX_QUEUE_SIZE = 100;
+const HEARTBEAT_INTERVAL_MS = 30_000;
+const MSG_ENCRYPTION_SECRET = process.env.WS_MSG_SECRET || randomBytes(32).toString('hex');
+
+// ── State ─────────────────────────────────────────────────────────────────────
 let wss = null;
 
-// Map of publicKey -> Set of ws clients subscribed to that account
+/** publicKey → Set<ws> */
 const subscriptions = new Map();
 
+/** publicKey → pending message queue (for offline/reconnect delivery) */
+const messageQueues = new Map();
+
+/** Analytics counters */
+const stats = {
+  totalConnections: 0,
+  activeConnections: 0,
+  messagesDelivered: 0,
+  messagesQueued: 0,
+  authFailures: 0,
+  errors: 0,
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function signPayload(payload) {
+  return createHmac('sha256', MSG_ENCRYPTION_SECRET)
+    .update(typeof payload === 'string' ? payload : JSON.stringify(payload))
+    .digest('hex');
+}
+
+function buildEnvelope(payload) {
+  const body = JSON.stringify(payload);
+  const sig = signPayload(body);
+  return JSON.stringify({ data: payload, sig });
+}
+
+function verifyToken(token) {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) return null;
+  try {
+    return jwt.verify(token, secret);
+  } catch {
+    return null;
+  }
+}
+
+function enqueue(publicKey, payload) {
+  if (!messageQueues.has(publicKey)) messageQueues.set(publicKey, []);
+  const q = messageQueues.get(publicKey);
+  if (q.length >= MAX_QUEUE_SIZE) q.shift(); // drop oldest
+  q.push(payload);
+  stats.messagesQueued++;
+}
+
+function flushQueue(publicKey, ws) {
+  const q = messageQueues.get(publicKey);
+  if (!q || q.length === 0) return;
+  for (const payload of q) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(buildEnvelope(payload));
+      stats.messagesDelivered++;
+    }
+  }
+  messageQueues.delete(publicKey);
+}
+
+function connectionCount(publicKey) {
+  return subscriptions.get(publicKey)?.size ?? 0;
+}
+
+function removeClient(ws) {
+  if (ws.subscribedKey) {
+    subscriptions.get(ws.subscribedKey)?.delete(ws);
+    if (subscriptions.get(ws.subscribedKey)?.size === 0) {
+      subscriptions.delete(ws.subscribedKey);
+    }
+  }
+  stats.activeConnections = Math.max(0, stats.activeConnections - 1);
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Attach a WebSocket server to an existing HTTP(S) server and wire up
+ * authentication, subscription routing, heartbeat, and Prometheus metrics.
+ * @param {import('http').Server} server - The HTTP(S) server to attach the WebSocket upgrade handler to
+ * @returns {void}
+ */
 export function initWebSocket(server) {
   wss = new WebSocketServer({ server });
 
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
+    stats.totalConnections++;
+    stats.activeConnections++;
     ws.isAlive = true;
+
+    // Authenticate at connection time so clients receive close code 4001
+    const jwtSecret = process.env.JWT_SECRET;
+    if (jwtSecret) {
+      const url = new URL(req.url, 'ws://localhost');
+      const token =
+        url.searchParams.get('token') ||
+        (req.headers.authorization?.startsWith('Bearer ')
+          ? req.headers.authorization.slice(7)
+          : null);
+      const claims = token ? verifyToken(token) : null;
+      if (!claims) {
+        stats.authFailures++;
+        stats.activeConnections = Math.max(0, stats.activeConnections - 1);
+        ws.close(4001, 'Unauthorized');
+        return;
+      }
+      ws.userId = claims.sub ?? claims.userId;
+      ws.userPublicKey = claims.publicKey ?? null;
+    }
+
+    ws.authenticated = true;
 
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (raw) => {
       try {
         const msg = JSON.parse(raw);
-        if (msg.type === 'subscribe' && msg.publicKey) {
-          if (!subscriptions.has(msg.publicKey)) subscriptions.set(msg.publicKey, new Set());
-          subscriptions.get(msg.publicKey).add(ws);
-          ws.subscribedKey = msg.publicKey;
-          ws.send(JSON.stringify({ type: 'subscribed', publicKey: msg.publicKey }));
-        }
-      } catch (_) {}
-    });
-
-    ws.on('close', () => {
-      if (ws.subscribedKey) {
-        subscriptions.get(ws.subscribedKey)?.delete(ws);
+        handleMessage(ws, msg);
+      } catch {
+        ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
+        stats.errors++;
       }
     });
 
+    ws.on('close', () => removeClient(ws));
+
     ws.on('error', (err) => {
-      console.error('WebSocket error:', err.message);
+      logger.error('ws.error', { message: err.message });
+      stats.errors++;
+      removeClient(ws);
     });
   });
 
-  // Heartbeat to detect stale connections
-  const interval = setInterval(() => {
+  // Heartbeat — detect and terminate stale connections
+  const heartbeat = setInterval(() => {
     wss.clients.forEach((ws) => {
-      if (!ws.isAlive) return ws.terminate();
+      if (!ws.isAlive) {
+        removeClient(ws);
+        return ws.terminate();
+      }
       ws.isAlive = false;
       ws.ping();
     });
-  }, 30000);
+  }, HEARTBEAT_INTERVAL_MS);
 
-  wss.on('close', () => clearInterval(interval));
+  wss.on('close', () => clearInterval(heartbeat));
+
+  logger.info('ws.initialized');
 }
 
+function handleMessage(ws, msg) {
+  switch (msg.type) {
+    case 'auth':
+      return handleAuth(ws, msg);
+    case 'subscribe':
+      return handleSubscribe(ws, msg);
+    case 'unsubscribe':
+      return handleUnsubscribe(ws, msg);
+    case 'ping':
+      return ws.send(JSON.stringify({ type: 'pong' }));
+    default:
+      ws.send(JSON.stringify({ type: 'error', message: `Unknown message type: ${msg.type}` }));
+  }
+}
+
+function handleAuth(ws, msg) {
+  // Authentication is handled at handshake time; this message is a no-op for
+  // already-authenticated connections but kept for protocol compatibility.
+  if (ws.authenticated) {
+    ws.send(JSON.stringify({ type: 'auth_ok' }));
+    return;
+  }
+  // Dev mode (no JWT_SECRET): allow post-connection auth via message.
+  const jwtSecret = process.env.JWT_SECRET;
+  if (!jwtSecret) {
+    ws.authenticated = true;
+    ws.send(JSON.stringify({ type: 'auth_ok' }));
+    return;
+  }
+  stats.authFailures++;
+  ws.send(JSON.stringify({ type: 'auth_error', message: 'Invalid or expired token' }));
+}
+
+function handleSubscribe(ws, msg) {
+  if (!ws.authenticated) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Authenticate first' }));
+    return;
+  }
+  const { publicKey } = msg;
+  if (!publicKey) {
+    ws.send(JSON.stringify({ type: 'error', message: 'publicKey required' }));
+    return;
+  }
+  // Scope check: reject subscriptions to keys the user does not own.
+  // ws.userPublicKey is populated from the JWT claim; null means dev mode (no restriction).
+  if (ws.userPublicKey && publicKey !== 'rates' && publicKey !== ws.userPublicKey) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Unauthorized: cannot subscribe to another account' }));
+    return;
+  }
+  if (connectionCount(publicKey) >= MAX_CONNECTIONS_PER_KEY) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Connection limit reached for this account' }));
+    return;
+  }
+  if (!subscriptions.has(publicKey)) subscriptions.set(publicKey, new Set());
+  subscriptions.get(publicKey).add(ws);
+  ws.subscribedKey = publicKey;
+  ws.send(JSON.stringify({ type: 'subscribed', publicKey }));
+  // Deliver any queued messages
+  flushQueue(publicKey, ws);
+}
+
+function handleUnsubscribe(ws, msg) {
+  const key = msg.publicKey ?? ws.subscribedKey;
+  if (key) subscriptions.get(key)?.delete(ws);
+  ws.subscribedKey = null;
+  ws.send(JSON.stringify({ type: 'unsubscribed' }));
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/**
+ * Broadcast a payload to all subscribers of a publicKey.
+ * If no subscribers are connected, the message is queued for later delivery
+ * (up to MAX_QUEUE_SIZE, oldest dropped first) and flushed on the next subscribe.
+ * @param {string} publicKey - Stellar public key (or "rates") whose subscribers should receive the payload
+ * @param {object} payload - JSON-serializable message body; delivered wrapped in an HMAC-signed envelope
+ * @returns {void}
+ */
 export function broadcastToAccount(publicKey, payload) {
   const clients = subscriptions.get(publicKey);
-  if (!clients) return;
-  const msg = JSON.stringify(payload);
+  if (!clients || clients.size === 0) {
+    enqueue(publicKey, payload);
+    return;
+  }
+  const envelope = buildEnvelope(payload);
   clients.forEach((ws) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(envelope);
+      stats.messagesDelivered++;
+    }
   });
 }
+
+/**
+ * Get live WebSocket analytics for monitoring dashboards and the Prometheus scrape endpoint.
+ * @returns {{totalConnections: number, activeConnections: number, messagesDelivered: number, messagesQueued: number, authFailures: number, errors: number, subscribedAccounts: number, queuedAccounts: number, totalQueued: number}} Current counters and queue sizes
+ */
+export function getWsStats() {
+  return {
+    ...stats,
+    subscribedAccounts: subscriptions.size,
+    queuedAccounts: messageQueues.size,
+    totalQueued: [...messageQueues.values()].reduce((s, q) => s + q.length, 0),
+  };
+}
+
+// ── Prometheus metrics ────────────────────────────────────────────────────────
+// Register WebSocket metrics with the shared Prometheus provider so they appear
+// in the /metrics scrape endpoint alongside all other application metrics.
+registerMetricProvider((lines, { counter, gauge }) => {
+  const s = getWsStats();
+  counter(
+    'ws_connections_total',
+    'Total number of WebSocket connections accepted since startup',
+    s.totalConnections,
+  );
+  gauge(
+    'ws_connections_active',
+    'Number of currently open WebSocket connections',
+    s.activeConnections,
+  );
+  counter(
+    'ws_messages_delivered_total',
+    'Total number of WebSocket messages delivered to connected clients',
+    s.messagesDelivered,
+  );
+  counter(
+    'ws_messages_queued_total',
+    'Total number of WebSocket messages queued for offline clients',
+    s.messagesQueued,
+  );
+  counter(
+    'ws_auth_failures_total',
+    'Total number of WebSocket authentication failures',
+    s.authFailures,
+  );
+  counter(
+    'ws_errors_total',
+    'Total number of WebSocket connection errors',
+    s.errors,
+  );
+  gauge(
+    'ws_subscribed_accounts',
+    'Number of Stellar accounts with at least one active WebSocket subscriber',
+    s.subscribedAccounts,
+  );
+  gauge(
+    'ws_queued_accounts',
+    'Number of accounts with messages pending delivery (offline queue)',
+    s.queuedAccounts,
+  );
+  gauge(
+    'ws_queued_messages_total',
+    'Total number of messages waiting in offline delivery queues',
+    s.totalQueued,
+  );
+});

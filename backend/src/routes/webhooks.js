@@ -1,45 +1,312 @@
 import express from 'express';
-import { body, param, validationResult } from 'express-validator';
-import { registerWebhook, listWebhooks, getWebhook, deleteWebhook } from '../webhooks/store.js';
+import { requireAuth } from '../middleware/auth.js';
+import {
+  registerWebhook,
+  listWebhooks,
+  deleteWebhook,
+  rotateWebhookSecret,
+  verifyWebhookSignature,
+  getWebhook,
+  MAX_WEBHOOKS_PER_ACCOUNT,
+} from '../webhooks/store.js';
+import { webhookSignatureMiddleware } from '../webhooks/verifySignature.js';
+import { validateWebhookUrl } from '../webhooks/urlValidator.js';
+import prisma from '../db/client.js';
+import logger from '../config/logger.js';
 
 const router = express.Router();
 
-const validate = (req, res, next) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(422).json({ errors: errors.array() });
-  next();
-};
+/**
+ * @swagger
+ * /api/webhooks:
+ *   post:
+ *     summary: Register a new webhook
+ *     tags: [Webhooks]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [url, events]
+ *             properties:
+ *               url:
+ *                 type: string
+ *                 format: uri
+ *               events:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *     responses:
+ *       201:
+ *         description: Webhook registered
+ *       400:
+ *         description: Validation error or per-account webhook cap reached
+ *       401:
+ *         description: Unauthorized
+ */
+router.post('/', requireAuth, async (req, res) => {
+  const { url, events } = req.body;
 
-// POST /api/webhooks — register a webhook
-router.post('/',
-  body('url').isURL().withMessage('Valid URL required'),
-  body('accountId').trim().notEmpty().withMessage('accountId required'),
-  body('events').optional().isArray().withMessage('events must be an array'),
-  validate,
-  (req, res) => {
-    const { url, accountId, events, secret } = req.body;
-    const webhook = registerWebhook({ url, accountId, events, secret });
-    res.status(201).json(webhook);
+  if (!url) return res.status(400).json({ error: 'url is required' });
+
+  const validation = await validateWebhookUrl(url);
+  if (!validation.valid) {
+    return res.status(400).json({ error: validation.error });
   }
-);
 
-// GET /api/webhooks?accountId=...
-router.get('/', (req, res) => {
-  res.json(listWebhooks(req.query.accountId));
+  try {
+    const webhook = await registerWebhook({
+      url,
+      accountId: req.user.sub,
+      events: events || ['*'],
+    });
+
+    logger.info({ webhookId: webhook.id, accountId: req.user.sub }, 'Webhook registered');
+    res.status(201).json(webhook);
+  } catch (err) {
+    if (err.message.startsWith('Webhook limit reached')) {
+      return res.status(400).json({ error: err.message });
+    }
+    logger.error({ err }, 'Failed to register webhook');
+    res.status(500).json({ error: 'Failed to register webhook' });
+  }
 });
 
-// GET /api/webhooks/:id
-router.get('/:id', param('id').trim().notEmpty(), validate, (req, res) => {
-  const webhook = getWebhook(req.params.id);
-  if (!webhook) return res.status(404).json({ error: 'Webhook not found' });
-  const { signingSecret: _, ...safe } = webhook;
-  res.json(safe);
+/**
+ * @swagger
+ * /api/webhooks:
+ *   get:
+ *     summary: List webhooks for authenticated user
+ *     tags: [Webhooks]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: List of webhooks
+ *       401:
+ *         description: Unauthorized
+ */
+router.get('/', requireAuth, async (req, res) => {
+  try {
+    const webhooks = await listWebhooks(req.user.sub);
+    res.json(webhooks);
+  } catch (err) {
+    logger.error({ err }, 'Failed to list webhooks');
+    res.status(500).json({ error: 'Failed to list webhooks' });
+  }
 });
 
-// DELETE /api/webhooks/:id
-router.delete('/:id', param('id').trim().notEmpty(), validate, (req, res) => {
-  if (!deleteWebhook(req.params.id)) return res.status(404).json({ error: 'Webhook not found' });
-  res.json({ message: 'Webhook deleted' });
+/**
+ * @swagger
+ * /api/webhooks/{id}:
+ *   delete:
+ *     summary: Delete a webhook
+ *     tags: [Webhooks]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Webhook deleted
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Webhook not found
+ */
+router.delete('/:id', requireAuth, async (req, res) => {
+  try {
+    const webhook = await getWebhook(req.params.id);
+    if (!webhook || webhook.accountId !== req.user.sub) {
+      if (webhook) {
+        logger.warn(
+          { webhookId: req.params.id, accountId: req.user.sub, ownerAccountId: webhook.accountId },
+          'Denied cross-account webhook delete attempt',
+        );
+      }
+      return res.status(404).json({ error: 'Webhook not found' });
+    }
+
+    await deleteWebhook(req.params.id);
+    logger.info({ webhookId: req.params.id, accountId: req.user.sub }, 'Webhook deleted');
+    res.json({ message: 'Webhook deleted' });
+  } catch (err) {
+    logger.error({ err }, 'Failed to delete webhook');
+    res.status(500).json({ error: 'Failed to delete webhook' });
+  }
 });
 
+/**
+ * @swagger
+ * /api/webhooks/{id}/rotate-secret:
+ *   post:
+ *     summary: Rotate webhook secret
+ *     tags: [Webhooks]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Secret rotated
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Webhook not found
+ */
+router.post('/:id/rotate-secret', requireAuth, async (req, res) => {
+  try {
+    const webhook = await getWebhook(req.params.id);
+    if (!webhook || webhook.accountId !== req.user.sub) {
+      if (webhook) {
+        logger.warn(
+          { webhookId: req.params.id, accountId: req.user.sub, ownerAccountId: webhook.accountId },
+          'Denied cross-account webhook secret rotation attempt',
+        );
+      }
+      return res.status(404).json({ error: 'Webhook not found' });
+    }
+
+    const result = await rotateWebhookSecret(req.params.id);
+    logger.info({ webhookId: req.params.id, accountId: req.user.sub }, 'Webhook secret rotated');
+    res.json(result);
+  } catch (err) {
+    if (err.message === 'Webhook not found') {
+      return res.status(404).json({ error: 'Webhook not found' });
+    }
+    logger.error({ err }, 'Failed to rotate webhook secret');
+    res.status(500).json({ error: 'Failed to rotate webhook secret' });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/webhooks/{id}/deliveries:
+ *   get:
+ *     summary: Get paginated delivery history for a webhook
+ *     tags: [Webhooks]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *           enum: [PENDING, DELIVERED, FAILED]
+ *     responses:
+ *       200:
+ *         description: Paginated delivery history
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Webhook not found
+ */
+router.get('/:id/deliveries', requireAuth, async (req, res) => {
+  try {
+    const webhook = await getWebhook(req.params.id);
+    if (!webhook || webhook.accountId !== req.user.sub) {
+      return res.status(404).json({ error: 'Webhook not found' });
+    }
+
+    const { page = 1, status } = req.query;
+    const take = Math.min(parseInt(req.query.limit) || 20, 100);
+    const skip = (parseInt(page) - 1) * take;
+
+    const where = { webhookId: webhook.id };
+    if (status) where.status = status;
+
+    const [deliveries, total] = await Promise.all([
+      prisma.webhookDelivery.findMany({
+        where,
+        skip,
+        take,
+        orderBy: { createdAt: 'desc' },
+      }),
+      prisma.webhookDelivery.count({ where }),
+    ]);
+
+    res.json({
+      deliveries,
+      pagination: { page: parseInt(page), limit: take, total, pages: Math.ceil(total / take) },
+    });
+  } catch (err) {
+    logger.error({ err }, 'Failed to load webhook deliveries');
+    res.status(500).json({ error: 'Failed to load webhook deliveries' });
+  }
+});
+
+/**
+ * POST /api/v1/webhooks/incoming
+ * Receive and process incoming webhook payloads from external services.
+ * Signature is verified via HMAC-SHA256 before any processing occurs.
+ */
+router.post('/incoming', webhookSignatureMiddleware, (req, res) => {
+  logger.info(
+    { source: req.headers['x-webhook-source'] ?? 'unknown' },
+    'Incoming webhook received',
+  );
+  res.status(200).json({ received: true });
+});
+
+/**
+ * @swagger
+ * /api/webhooks/verify:
+ *   post:
+ *     summary: Verify webhook signature (for testing)
+ *     tags: [Webhooks]
+ *     security: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [webhookId, signature, payload]
+ *             properties:
+ *               webhookId:
+ *                 type: string
+ *               signature:
+ *                 type: string
+ *               payload:
+ *                 type: object
+ *     responses:
+ *       200:
+ *         description: Verification result
+ */
+router.post('/verify', async (req, res) => {
+  const { webhookId, signature, payload } = req.body;
+
+  if (!webhookId || !signature || !payload) {
+    return res.status(400).json({ error: 'webhookId, signature, and payload are required' });
+  }
+
+  const valid = await verifyWebhookSignature(webhookId, signature, payload);
+  res.json({ valid });
+});
+
+export { MAX_WEBHOOKS_PER_ACCOUNT };
 export default router;

@@ -7,6 +7,12 @@ import {
   mobileSecurity,
   mobileAnalytics,
 } from '../mobile/index.js';
+import {
+  generateRegistrationOptions,
+  verifyAndStoreRegistration,
+  generateAuthenticationOptions,
+  verifyAuthentication,
+} from '../mobile/webAuthn.js';
 import * as StellarService from '../services/stellar.js';
 
 const router = express.Router();
@@ -78,6 +84,55 @@ router.post('/auth/biometric/verify', (req, res) => {
   }
 });
 
+// ─── WebAuthn ─────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/mobile/auth/webauthn/register
+ * Phase 1 (no credential in body): returns registration options.
+ * Phase 2 (credential in body):    verifies and persists credential in DB.
+ */
+router.post('/auth/webauthn/register', async (req, res) => {
+  try {
+    const { userId, username, challengeId, credential, deviceName } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+    if (!challengeId) {
+      // Phase 1 — return options for navigator.credentials.create()
+      return res.json(await generateRegistrationOptions(userId, username));
+    }
+
+    // Phase 2 — store the credential
+    const result = await verifyAndStoreRegistration(challengeId, credential, deviceName);
+    res.status(201).json(result);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+/**
+ * POST /api/mobile/auth/webauthn/authenticate
+ * Phase 1 (no assertion in body): returns authentication options.
+ * Phase 2 (assertion in body):    verifies assertion and returns JWT.
+ */
+router.post('/auth/webauthn/authenticate', async (req, res) => {
+  try {
+    const { userId, challengeId, assertion } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+    if (!challengeId) {
+      // Phase 1 — return options for navigator.credentials.get()
+      const options = await generateAuthenticationOptions(userId);
+      return res.json(options);
+    }
+
+    // Phase 2 — verify assertion and issue JWT
+    const result = await verifyAuthentication(challengeId, assertion);
+    res.json(result);
+  } catch (e) {
+    res.status(401).json({ error: e.message });
+  }
+});
+
 // ─── Push Notifications ───────────────────────────────────────────────────────
 
 /** POST /api/mobile/notifications/register */
@@ -108,25 +163,25 @@ router.post('/notifications/send', requireMobileAuth, async (req, res) => {
 // ─── Sessions ─────────────────────────────────────────────────────────────────
 
 /** POST /api/mobile/sessions */
-router.post('/sessions', requireMobileAuth, (req, res) => {
-  const sessionId = mobileSessions.create(req.mobile.userId, req.mobile.deviceId, req.body.metadata);
+router.post('/sessions', requireMobileAuth, async (req, res) => {
+  const sessionId = await mobileSessions.create(req.mobile.userId, req.mobile.deviceId, req.body.metadata);
   res.json({ sessionId });
 });
 
 /** GET /api/mobile/sessions */
-router.get('/sessions', requireMobileAuth, (req, res) => {
-  res.json(mobileSessions.listForUser(req.mobile.userId));
+router.get('/sessions', requireMobileAuth, async (req, res) => {
+  res.json(await mobileSessions.listForUser(req.mobile.userId));
 });
 
 /** DELETE /api/mobile/sessions/:sessionId */
-router.delete('/sessions/:sessionId', requireMobileAuth, (req, res) => {
-  mobileSessions.revoke(req.params.sessionId);
+router.delete('/sessions/:sessionId', requireMobileAuth, async (req, res) => {
+  await mobileSessions.revoke(req.params.sessionId);
   res.json({ revoked: true });
 });
 
 /** DELETE /api/mobile/sessions */
-router.delete('/sessions', requireMobileAuth, (req, res) => {
-  const count = mobileSessions.revokeAll(req.mobile.userId);
+router.delete('/sessions', requireMobileAuth, async (req, res) => {
+  const count = await mobileSessions.revokeAll(req.mobile.userId);
   res.json({ revoked: count });
 });
 
@@ -218,8 +273,8 @@ router.get('/account/:publicKey/balance', requireMobileAuth, async (req, res) =>
 router.get('/account/:publicKey/transactions', requireMobileAuth, async (req, res) => {
   try {
     const { limit = 10, cursor } = req.query;
-    const txns = await StellarService.getTransactionHistory(req.params.publicKey, { limit: Number(limit), cursor });
-    res.json(txns);
+    const result = await StellarService.getTransactions(req.params.publicKey, { limit: Number(limit), cursor });
+    res.json({ publicKey: req.params.publicKey, transactions: result.records, nextCursor: result.nextCursor, hasMore: result.hasMore });
   } catch (e) {
     res.status(404).json({ error: e.message });
   }

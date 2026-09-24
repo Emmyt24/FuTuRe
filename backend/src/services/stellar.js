@@ -1,14 +1,143 @@
 import * as StellarSDK from '@stellar/stellar-sdk';
+import { randomUUID } from 'crypto';
 import { eventMonitor } from '../eventSourcing/index.js';
 import { getConfig } from '../config/env.js';
-import logger from '../config/logger.js';
+import { getIssuer } from '../config/assets.js';
+import logger, { withContext } from '../config/logger.js';
 import prisma from '../db/client.js';
-import { getConfig } from '../config/env.js';
+import { createCircuitBreaker } from './circuitBreaker.js';
+import { getCachedBalance, invalidateBalanceCache } from '../cache/balanceCache.js';
+import { recordHorizonCall } from '../monitoring/horizonAlerter.js';
+import { withSpan } from '../config/otel.js';
+import { recordFeeSample, getSevenDayAverageFee, detectFeeSurge } from './feeSurge.js';
+import { sequenceManager } from './sequenceManager.js';
+
+const stellarInteractiveBreaker = createCircuitBreaker('Horizon-Interactive');
+
+/**
+ * Retrieve aggregate fee-bump statistics from the database.
+ * @returns {Promise<{total: number, totalFeeStroops: number, uniqueAccounts: number}>}
+ */
+export async function getFeeBumpStats() {
+  const [summaryAgg, uniqueAccounts] = await Promise.all([
+    prisma.feeBumpSummary.aggregate({
+      _sum: {
+        total: true,
+        totalFeeStroops: true,
+      },
+    }),
+    prisma.feeBumpAccount.count(),
+  ]);
+  return {
+    total: Number(summaryAgg?._sum?.total ?? 0),
+    totalFeeStroops: Number(summaryAgg?._sum?.totalFeeStroops ?? 0),
+    uniqueAccounts,
+  };
+}
+
+async function incrementFeeBumpStats(sourcePublicKey, feeStroops) {
+  try {
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+
+    // Account insert is contention-free via ON CONFLICT DO NOTHING.
+    // Daily summary update keeps counters bounded by date instead of one singleton row.
+    await Promise.all([
+      prisma.$executeRaw`
+        INSERT INTO "FeeBumpAccount" ("publicKey", "firstUsedAt")
+        VALUES (${sourcePublicKey}, NOW())
+        ON CONFLICT ("publicKey") DO NOTHING
+      `,
+      prisma.$executeRaw`
+        INSERT INTO "FeeBumpSummary" ("date", "total", "totalFeeStroops", "createdAt", "updatedAt")
+        VALUES (${today}, 1, ${feeStroops}, NOW(), NOW())
+        ON CONFLICT ("date")
+        DO UPDATE SET
+          "total" = "FeeBumpSummary"."total" + 1,
+          "totalFeeStroops" = "FeeBumpSummary"."totalFeeStroops" + ${feeStroops},
+          "updatedAt" = NOW()
+      `,
+    ]);
+  } catch (err) {
+    logger.warn('stellar.feeBumpStats.persist.failed', { error: err.message });
+  }
+}
+
+function isBadSequenceError(err) {
+  const txCode =
+    err?.response?.data?.extras?.result_codes?.transaction ??
+    err?.data?.extras?.result_codes?.transaction;
+  if (txCode === 'tx_bad_seq') return true;
+  return String(err?.message ?? '').includes('tx_bad_seq');
+}
+
+/**
+ * Fee Bump Transaction
+ * A fee bump allows a third-party sponsor (e.g. the platform account) to pay the
+ * transaction fee on behalf of the source account. This is useful when users have
+ * low XLM balances and cannot cover fees themselves — the inner transaction is
+ * signed by the original sender, then wrapped so the sponsor covers the fee.
+ * @see https://developers.stellar.org/docs/learn/fundamentals/transactions/fee-bumps
+ *
+ * Wrap an inner transaction with a FeeBumpTransaction so the platform account
+ * pays the fee instead of the buyer. Fee multiplier is read from FEE_BUMP_MULTIPLIER
+ * (default 10×).
+ * @param {import('@stellar/stellar-sdk').Transaction} innerTx - Signed inner transaction to wrap
+ * @param {string} feeAccountSecret - Secret key of the fee-sponsoring platform account
+ * @returns {import('@stellar/stellar-sdk').FeeBumpTransaction} Signed fee-bump transaction ready to submit
+ */
+export function wrapWithFeeBump(innerTx, feeAccountSecret) {
+  const feeKeypair = StellarSDK.Keypair.fromSecret(feeAccountSecret);
+  const networkPassphrase = getNetworkPassphrase();
+
+  const multiplier = parseInt(process.env.FEE_BUMP_MULTIPLIER ?? '10', 10);
+  const minFee = parseInt(process.env.MIN_FEE_STROOPS ?? String(StellarSDK.BASE_FEE), 10);
+  const maxFee = parseInt(process.env.MAX_FEE_BUMP_STROOPS ?? process.env.MAX_FEE_STROOPS ?? '100000', 10);
+
+  let surgeFee = 0;
+  try {
+    const avgFee = getSevenDayAverageFee();
+    const surgeInfo = detectFeeSurge(StellarSDK.BASE_FEE * multiplier, avgFee);
+    if (surgeInfo?.surge && avgFee) {
+      surgeFee = Math.round(avgFee * surgeInfo.ratio);
+    }
+  } catch (err) {
+    logger.warn('stellar.wrapWithFeeBump.feeSurgeCheck.failed', { error: err.message });
+  }
+
+  const baseConfiguredFee = StellarSDK.BASE_FEE * multiplier;
+  const calculatedFee = Math.max(surgeFee, baseConfiguredFee, minFee);
+  const finalFee = Math.min(calculatedFee, maxFee);
+
+  logger.info('stellar.wrapWithFeeBump.feeDetermined', {
+    multiplier,
+    baseConfiguredFee,
+    surgeFee,
+    minFee,
+    maxFee,
+    finalFee,
+  });
+
+  const feeBumpTx = StellarSDK.TransactionBuilder.buildFeeBumpTransaction(
+    feeKeypair,
+    finalFee,
+    innerTx,
+    networkPassphrase,
+  );
+  feeBumpTx.sign(feeKeypair);
+  return feeBumpTx;
+}
 
 let horizonServerUrl;
 let horizonServer;
+const STELLAR_MEMO_ID_MAX = 18446744073709551615n;
+const DEFAULT_FUTURENET_PASSPHRASE = 'Test SDF Future Network ; October 2022';
 
-function getHorizonServer() {
+/**
+ * Return a cached Stellar Horizon server instance, re-creating it if the URL has changed.
+ * @returns {import('@stellar/stellar-sdk').Horizon.Server}
+ */
+export function getHorizonServer() {
   const { horizonUrl } = getConfig().stellar;
   if (!horizonServer || horizonUrl !== horizonServerUrl) {
     horizonServerUrl = horizonUrl;
@@ -17,101 +146,529 @@ function getHorizonServer() {
   return horizonServer;
 }
 
-function isTestnet() {
+/** Timeout (ms) for Horizon calls. Reads HORIZON_TIMEOUT_MS env var, default 10 000. */
+export function getHorizonTimeout() {
+  return parseInt(process.env.HORIZON_TIMEOUT_MS ?? '10000', 10);
+}
+
+/**
+ * Run a Horizon call with a timeout and circuit breaker.  Throws a 504-tagged
+ * error on timeout, or a 503-tagged error when the circuit is open.
+ * @template T
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+export async function withHorizonTimeout(fn) {
+  const ms = getHorizonTimeout();
+  return stellarInteractiveBreaker.call(() => {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const err = new Error('Horizon request timed out');
+        err.isTimeout = true;
+        reject(err);
+      }, ms);
+    });
+    return Promise.race([fn(), timeout]).finally(() => clearTimeout(timer));
+  });
+}
+
+const HORIZON_RETRY_BACKOFFS = [500, 1000, 2000];
+
+function isTransientHorizonError(err) {
+  const status = err?.response?.status ?? err?.status;
+  if (status === 400 || status === 401 || status === 403 || status === 404 || status === 409) return false;
+  if (status === 429 || status === 502 || status === 503 || status === 504 || status === 520 || (status >= 500 && status < 600)) return true;
+  if (err.isTimeout) return true;
+  const code = err?.code;
+  if (
+    code === 'ECONNREFUSED' ||
+    code === 'ENOTFOUND' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNRESET'
+  )
+    return true;
+  return false;
+}
+
+/**
+ * Run a Horizon call with timeout, circuit breaker, and exponential backoff retry.
+ * Retries on 429, 503, and network timeouts (max 3 attempts: 500ms, 1s, 2s backoff).
+ * Does NOT retry on 400, 404, or 409.
+ * @template T
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+export async function withHorizonRetry(fn, txHash = null) {
+  let lastErr;
+  for (let attempt = 0; attempt <= HORIZON_RETRY_BACKOFFS.length; attempt++) {
+    try {
+      const result = await withHorizonTimeout(fn);
+      recordHorizonCall(false);
+      return result;
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientHorizonError(err) || attempt === HORIZON_RETRY_BACKOFFS.length) {
+        recordHorizonCall(true);
+        throw err;
+      }
+
+      // If we have a transaction hash and encountered a timeout or network drop,
+      // verify if the transaction was already committed on-chain to avoid double submission.
+      if (txHash) {
+        try {
+          const confirmedTx = await getHorizonServer().transactions().transaction(txHash).call();
+          if (confirmedTx && (confirmedTx.successful !== undefined || confirmedTx.id || confirmedTx.hash)) {
+            logger.info('stellar.horizon.retry.alreadyCommitted', { txHash, ledger: confirmedTx.ledger_attr ?? confirmedTx.ledger });
+            recordHorizonCall(false);
+            return {
+              ...confirmedTx,
+              hash: confirmedTx.hash || txHash,
+              ledger: confirmedTx.ledger_attr ?? confirmedTx.ledger,
+              successful: confirmedTx.successful ?? true,
+            };
+          }
+        } catch (checkErr) {
+          // If 404, tx is not on-chain yet; proceed with retry. Otherwise log warning and proceed.
+          if (checkErr?.response?.status !== 404) {
+            logger.warn('stellar.horizon.retry.hashCheckFailed', { txHash, error: checkErr.message });
+          }
+        }
+      }
+
+      const delay = HORIZON_RETRY_BACKOFFS[attempt];
+      logger.warn('stellar.horizon.retry', { attempt: attempt + 1, delay, error: err.message });
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  recordHorizonCall(true);
+  throw lastErr;
+}
+
+/**
+ * Check whether the configured Stellar network is testnet.
+ * @returns {boolean}
+ */
+export function isTestnet() {
   return getConfig().stellar.network === 'testnet';
 }
 
-export async function createAccount() {
-  const pair = StellarSDK.Keypair.random();
-  const publicKey = pair.publicKey();
-  logger.info('stellar.createAccount', { publicKey });
-  
-  if (isTestnet()) {
-    await fetch(`https://friendbot.stellar.org?addr=${publicKey}`);
-    logger.debug('stellar.friendbotFunded', { publicKey });
-    await eventMonitor.publishEvent(publicKey, {
-      type: 'AccountFunded',
-      data: { publicKey },
-      version: 1
-    });
+/**
+ * Return network passphrase for the configured Stellar network.
+ * Supports testnet, mainnet, and futurenet.
+ * @returns {string}
+ */
+export function getNetworkPassphrase() {
+  const network = getConfig().stellar.network;
+  if (network === 'testnet') return StellarSDK.Networks.TESTNET;
+  if (network === 'mainnet') return StellarSDK.Networks.PUBLIC;
+  if (network === 'futurenet') return StellarSDK.Networks.FUTURENET ?? DEFAULT_FUTURENET_PASSPHRASE;
+  throw new Error(`Unsupported STELLAR_NETWORK value: ${network}`);
+}
+
+/**
+ * Error used when request payload data is semantically invalid.
+ */
+class ValidationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ValidationError';
+    this.status = 400;
+    this.statusCode = 400;
   }
-
-  await eventMonitor.publishEvent(publicKey, {
-    type: 'AccountCreated',
-    data: { publicKey, secretKey: pair.secret() },
-    version: 1
-  });
-
-  await prisma.user.upsert({
-    where: { publicKey },
-    update: {},
-    create: { publicKey },
-  }).catch(err => logger.warn('db.user.upsert.failed', { error: err.message }));
-  
-  return {
-    publicKey,
-    secretKey: pair.secret()
-  };
 }
 
-export async function getBalance(publicKey) {
-  logger.debug('stellar.getBalance', { publicKey });
-  const account = await getHorizonServer().loadAccount(publicKey);
-  const account = await server.loadAccount(publicKey);
-  const balances = account.balances.map(b => ({
-    asset: b.asset_type === 'native' ? 'XLM' : `${b.asset_code}:${b.asset_issuer}`,
-    balance: b.balance
-  }));
+/**
+ * Validate memo value against Stellar memo type constraints.
+ * @param {string|number|null} memo
+ * @param {'text'|'id'|'hash'|'return'} memoType
+ * @returns {void}
+ * @throws {ValidationError}
+ */
+export function validateMemo(memo, memoType = 'text') {
+  if (memo === null || memo === undefined || memo === '') return;
 
-  logger.info('stellar.balanceFetched', { publicKey, balances });
-  await eventMonitor.publishEvent(publicKey, {
-    type: 'BalanceChecked',
-    data: { balances },
-    version: 1
-  });
-
-  return { publicKey, balances };
+  const memoString = String(memo);
+  switch (memoType) {
+    case 'id': {
+      if (!/^\d+$/.test(memoString)) {
+        throw new ValidationError('MEMO_ID must be an unsigned 64-bit integer');
+      }
+      const value = BigInt(memoString);
+      if (value < 0n || value > STELLAR_MEMO_ID_MAX) {
+        throw new ValidationError('MEMO_ID must be between 0 and 18446744073709551615');
+      }
+      return;
+    }
+    case 'hash':
+    case 'return':
+      if (!/^[0-9a-fA-F]{64}$/.test(memoString)) {
+        throw new ValidationError(`MEMO_${memoType.toUpperCase()} must be a 32-byte hex string`);
+      }
+      return;
+    case 'text':
+    default: {
+      const memoBytes = Buffer.byteLength(memoString, 'utf8');
+      if (memoBytes > 28) {
+        throw new ValidationError('MEMO_TEXT exceeds 28 bytes limit');
+      }
+    }
+  }
 }
 
-export async function sendPayment(sourceSecret, destination, amount, assetCode = 'XLM') {
-  const { assetIssuer } = getConfig().stellar;
+/**
+ * Validate Horizon network passphrase matches configured network.
+ * @returns {Promise<{expectedPassphrase: string, actualPassphrase: string}>}
+ */
+export async function verifyHorizonNetworkPassphrase() {
+  const expectedPassphrase = getNetworkPassphrase();
+  const root = await withHorizonRetry(() => getHorizonServer().root());
+  const actualPassphrase = root?.network_passphrase;
+  if (actualPassphrase !== expectedPassphrase) {
+    const err = new Error(
+      `Horizon passphrase mismatch: expected "${expectedPassphrase}" but received "${actualPassphrase}"`,
+    );
+    err.status = 500;
+    err.statusCode = 500;
+    throw err;
+  }
+  return { expectedPassphrase, actualPassphrase };
+}
+
+/**
+ * Fund a testnet account via Friendbot (testnet only).
+ * @param {string} publicKey - Stellar public key of the account to fund
+ * @returns {Promise<{funded: boolean, publicKey: string}>}
+ * @throws {Error} If called on mainnet or if Friendbot returns a non-OK response
+ */
+export async function fundAccount(publicKey) {
+  if (!isTestnet()) throw new Error('Only available on testnet');
+  const res = await fetch(`https://friendbot.stellar.org?addr=${publicKey}`);
+  if (!res.ok) throw new Error(`Friendbot funding failed: ${res.status} ${res.statusText}`);
+  logger.debug('stellar.friendbotFunded', { publicKey });
+  return { funded: true, publicKey };
+}
+
+/**
+ * Generate a new Stellar keypair, fund it via Friendbot on testnet, and persist the user record.
+ * @param {string|null} [correlationId] - Optional correlation ID for request tracing
+ * @returns {Promise<{publicKey: string, secretKey: string}>} The newly created key pair
+ * @throws {Error} If Friendbot funding fails
+ * @example
+ * const { publicKey, secretKey } = await createAccount('req-abc-123');
+ */
+export async function createAccount(correlationId = null) {
+  return withSpan('stellar-service', 'stellar.createAccount', async (span) => {
+    const pair = StellarSDK.Keypair.random();
+    const publicKey = pair.publicKey();
+    span.setAttribute('stellar.publicKey', publicKey);
+    withContext(logger, { action: 'createAccount', correlationId }).info('stellar.createAccount', {
+      publicKey,
+    });
+
+    let stellarAccountStatus = 'ACTIVE';
+    if (isTestnet()) {
+      const friendbotRes = await fetch(`https://friendbot.stellar.org?addr=${publicKey}`);
+      if (!friendbotRes.ok) {
+        throw new Error(
+          `Friendbot funding failed: ${friendbotRes.status} ${friendbotRes.statusText}`,
+        );
+      }
+      logger.debug('stellar.friendbotFunded', { publicKey, correlationId });
+      await eventMonitor.publishEvent(publicKey, {
+        type: 'AccountFunded',
+        data: { publicKey, correlationId },
+        version: 1,
+      });
+    } else {
+      const sponsorSecret = process.env.PLATFORM_FUNDING_SECRET || process.env.PLATFORM_FEE_ACCOUNT_SECRET;
+      if (sponsorSecret) {
+        const sponsorKeypair = StellarSDK.Keypair.fromSecret(sponsorSecret);
+        const sponsorAccount = await withHorizonRetry(() =>
+          getHorizonServer().loadAccount(sponsorKeypair.publicKey()),
+        );
+        const startingBalance = process.env.STELLAR_MIN_ACCOUNT_RESERVE_XLM || '1';
+        const tx = new StellarSDK.TransactionBuilder(sponsorAccount, {
+          fee: StellarSDK.BASE_FEE,
+          networkPassphrase: getNetworkPassphrase(),
+        })
+          .addOperation(
+            StellarSDK.Operation.createAccount({
+              destination: publicKey,
+              startingBalance: String(startingBalance),
+            }),
+          )
+          .setTimeout(30)
+          .build();
+        tx.sign(sponsorKeypair);
+        await withHorizonRetry(() => getHorizonServer().submitTransaction(tx));
+        await eventMonitor.publishEvent(publicKey, {
+          type: 'AccountFunded',
+          data: { publicKey, correlationId, sponsor: sponsorKeypair.publicKey() },
+          version: 1,
+        });
+      } else {
+        stellarAccountStatus = 'PENDING_ACTIVATION';
+        logger.warn('stellar.createAccount.pendingActivation', {
+          publicKey,
+          correlationId,
+          network: getConfig().stellar.network,
+        });
+      }
+    }
+
+    await eventMonitor.publishEvent(publicKey, {
+      type: 'AccountCreated',
+      data: { publicKey, correlationId },
+      version: 1,
+    });
+
+    await prisma.user
+      .upsert({
+        where: { publicKey },
+        update: { stellarAccountStatus },
+        create: { publicKey, stellarAccountStatus },
+      })
+      .catch((err) => logger.warn('db.user.upsert.failed', { error: err.message, correlationId }));
+
+    return {
+      publicKey,
+      secretKey: pair.secret(),
+      status: stellarAccountStatus,
+    };
+  });
+}
+
+/**
+ * Fetch all asset balances for a Stellar account from Horizon.
+ * @param {string} publicKey - Stellar public key of the account
+ * @param {string|null} [correlationId] - Optional correlation ID for request tracing
+ * @returns {Promise<{publicKey: string, balances: Array<{asset: string, balance: string}>}>}
+ * @throws {Error} If the account does not exist on the network
+ */
+export async function getBalance(publicKey, correlationId = null) {
+  return withSpan('stellar-service', 'stellar.getBalance', async (span) => {
+    span.setAttribute('stellar.publicKey', publicKey);
+    logger.debug('stellar.getBalance', { publicKey, correlationId });
+    return getCachedBalance(publicKey, async () => {
+      const account = await withHorizonRetry(() => getHorizonServer().loadAccount(publicKey));
+      const balances = account.balances.map((b) => ({
+        asset: b.asset_type === 'native' ? 'XLM' : `${b.asset_code}:${b.asset_issuer}`,
+        balance: b.balance,
+      }));
+      logger.info('stellar.balanceFetched', { publicKey, balances, correlationId });
+      return { publicKey, balances };
+    });
+  });
+}
+
+/**
+ * Send a payment on the Stellar network. Automatically wraps in a fee-bump when the
+ * sender's XLM balance is below FEE_BUMP_THRESHOLD_XLM and PLATFORM_FEE_ACCOUNT_SECRET is set.
+ * Persists the transaction to the database and emits a PaymentSent event.
+ * @param {string} sourceSecret - Secret key of the sending account
+ * @param {string} destination - Stellar public key of the recipient
+ * @param {string|number} amount - Amount to send (in asset units)
+ * @param {string} [assetCode='XLM'] - Asset code (e.g. 'XLM', 'USDC')
+ * @param {string|null} [memo] - Optional transaction memo value
+ * @param {'text'|'id'|'hash'|'return'} [memoType='text'] - Stellar memo type
+ * @param {string|null} [correlationId] - Optional correlation ID for request tracing
+ * @returns {Promise<{hash: string, ledger: number, success: boolean, feeBump: boolean}>}
+ * @throws {Error} If ASSET_ISSUER is missing for non-XLM assets, or if Horizon submission fails
+ * @example
+ * const result = await sendPayment(secret, 'GDEST...', '10', 'USDC', 'invoice-42');
+ */
+export async function sendPayment(
+  sourceSecret,
+  destination,
+  amount,
+  assetCode = 'XLM',
+  memo = null,
+  memoType = 'text',
+  correlationId = null,
+) {
+  // Auto-generate a UUID correlation ID if the caller didn't supply one.
+  // This ID is stamped on every log line for this transaction attempt so
+  // engineers can filter the full lifecycle with a single query.
+  const txCorrelationId = correlationId ?? randomUUID();
+
   const sourceKeypair = StellarSDK.Keypair.fromSecret(sourceSecret);
-  const sourcePublicKey = sourceKeypair.publicKey();
-  logger.info('stellar.sendPayment.start', { source: sourcePublicKey, destination, amount, assetCode });
+  validateMemo(memo, memoType);
 
-  const sourceAccount = await getHorizonServer().loadAccount(sourcePublicKey);
-  const sourceAccount = await server.loadAccount(sourcePublicKey);
-  
-  if (assetCode !== 'XLM' && !assetIssuer) {
+  const sourcePublicKey = sourceKeypair.publicKey();
+  logger.info('stellar.sendPayment.start', {
+    source: sourcePublicKey,
+    destination,
+    amount,
+    assetCode,
+    memo,
+    memoType,
+    correlationId: txCorrelationId,
+  });
+
+  if (assetCode !== 'XLM' && !getIssuer(assetCode)) {
     throw new Error('ASSET_ISSUER is required for non-XLM payments');
   }
 
-  const asset = assetCode === 'XLM' 
-    ? StellarSDK.Asset.native() 
-    : new StellarSDK.Asset(assetCode, getIssuer(assetCode));
-  
-  const transaction = new StellarSDK.TransactionBuilder(sourceAccount, {
+  const asset =
+    assetCode === 'XLM'
+      ? StellarSDK.Asset.native()
+      : new StellarSDK.Asset(assetCode, getIssuer(assetCode));
+
+  const txBuilder = new StellarSDK.TransactionBuilder(sourceAccount, {
     fee: StellarSDK.BASE_FEE,
-    networkPassphrase: isTestnet() 
-      ? StellarSDK.Networks.TESTNET 
-      : StellarSDK.Networks.PUBLIC
-  })
-    .addOperation(StellarSDK.Operation.payment({
+    networkPassphrase: getNetworkPassphrase(),
+  }).addOperation(
+    StellarSDK.Operation.payment({
       destination,
       asset,
-      amount: amount.toString()
-    }))
-    .setTimeout(30)
-    .build();
-  
+      amount: amount.toString(),
+    }),
+  );
+
+  if (memo) {
+    let stellarMemo;
+    switch (memoType) {
+      case 'id':
+        stellarMemo = StellarSDK.Memo.id(memo);
+        break;
+      case 'hash':
+        stellarMemo = StellarSDK.Memo.hash(memo);
+        break;
+      case 'return':
+        stellarMemo = StellarSDK.Memo.return(memo);
+        break;
+      case 'text':
+      default:
+        stellarMemo = StellarSDK.Memo.text(memo);
+        break;
+    }
+    txBuilder.addMemo(stellarMemo);
+  }
+
+  const transaction = txBuilder.setTimeout(30).build();
+
   transaction.sign(sourceKeypair);
 
+  // Fee bump: wrap if buyer XLM balance is below threshold and platform key is configured
+  const platformFeeSecret = process.env.PLATFORM_FEE_ACCOUNT_SECRET;
+  const feeBumpThreshold = parseFloat(process.env.FEE_BUMP_THRESHOLD_XLM ?? '2');
+
   let result;
+  let usedFeeBump = false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const sequenceResult = await sequenceManager.withLock(sourcePublicKey, async () => {
+        const { account: sourceAccount, balances: sourceBalances } =
+          await sequenceManager.getAccountForBuild(sourcePublicKey, () =>
+            withHorizonRetry(() => getHorizonServer().loadAccount(sourcePublicKey)),
+          );
+
+        const txBuilder = new StellarSDK.TransactionBuilder(sourceAccount, {
+          fee: StellarSDK.BASE_FEE,
+          networkPassphrase: isTestnet() ? StellarSDK.Networks.TESTNET : StellarSDK.Networks.PUBLIC,
+        }).addOperation(
+          StellarSDK.Operation.payment({
+            destination,
+            asset,
+            amount: amount.toString(),
+          }),
+        );
+
+        if (memo) {
+          let stellarMemo;
+          switch (memoType) {
+            case 'id':
+              stellarMemo = StellarSDK.Memo.id(memo);
+              break;
+            case 'hash':
+              stellarMemo = StellarSDK.Memo.hash(memo);
+              break;
+            case 'return':
+              stellarMemo = StellarSDK.Memo.return(memo);
+              break;
+            case 'text':
+            default:
+              stellarMemo = StellarSDK.Memo.text(memo);
+              break;
+          }
+          txBuilder.addMemo(stellarMemo);
+        }
+
+        const transaction = txBuilder.setTimeout(30).build();
+        sequenceManager.markBuilt(sourcePublicKey, sourceAccount, sourceBalances);
+        transaction.sign(sourceKeypair);
+
+        let txToSubmit = transaction;
+        let feeBumpApplied = false;
+        if (platformFeeSecret) {
+          const xlmBalance = sourceBalances.find((b) => b.asset_type === 'native');
+          const xlmAmount = parseFloat(xlmBalance?.balance ?? '0');
+          if (xlmAmount < feeBumpThreshold) {
+            txToSubmit = wrapWithFeeBump(transaction, platformFeeSecret);
+            feeBumpApplied = true;
+            logger.info('stellar.feeBump.applied', {
+              source: sourcePublicKey,
+              xlmBalance: xlmAmount,
+              threshold: feeBumpThreshold,
+              correlationId: txCorrelationId,
+            });
+            await incrementFeeBumpStats(
+              sourcePublicKey,
+              StellarSDK.BASE_FEE * parseInt(process.env.FEE_BUMP_MULTIPLIER ?? '10', 10),
+            );
+          }
+        }
+
+        try {
+          const submissionResult = await withHorizonRetry(() =>
+            getHorizonServer().submitTransaction(txToSubmit),
+          );
+          return { submissionResult, feeBumpApplied };
+        } catch (submitErr) {
+          sequenceManager.clear(sourcePublicKey);
+          throw submitErr;
+        }
+      });
+
+      result = sequenceResult.submissionResult;
+      usedFeeBump = sequenceResult.feeBumpApplied;
+      break;
+    } catch (err) {
+      if (attempt === 0 && isBadSequenceError(err)) {
+        sequenceManager.clear(sourcePublicKey);
+        logger.warn('stellar.sendPayment.badSequenceResync', {
+          source: sourcePublicKey,
+          correlationId: txCorrelationId,
+          error: err.message,
+        });
+        continue;
+      }
+      logger.error('stellar.sendPayment.failed', {
+        source: sourcePublicKey,
+        destination,
+        amount,
+        assetCode,
+        error: err.message,
+        correlationId: txCorrelationId,
+      });
+      throw err;
+    }
+  }
+
+  let result;
+  const txHash = typeof txToSubmit?.hash === 'function' ? txToSubmit.hash().toString('hex') : null;
   try {
-    result = await getHorizonServer().submitTransaction(transaction);
-    result = await server.submitTransaction(transaction);
+    result = await withHorizonRetry(() => getHorizonServer().submitTransaction(txToSubmit), txHash);
   } catch (err) {
-    logger.error('stellar.sendPayment.failed', { source: sourcePublicKey, destination, amount, assetCode, error: err.message });
+    logger.error('stellar.sendPayment.failed', {
+      source: sourcePublicKey,
+      destination,
+      amount,
+      assetCode,
+      error: err.message,
+      correlationId: txCorrelationId,
+    });
     throw err;
   }
 
@@ -122,56 +679,134 @@ export async function sendPayment(sourceSecret, destination, amount, assetCode =
     assetCode,
     hash: result.hash,
     ledger: result.ledger,
+    feeBump: usedFeeBump,
+    memo,
+    memoType,
+    correlationId: txCorrelationId,
   });
+
+  await Promise.all([
+    invalidateBalanceCache(sourcePublicKey),
+    invalidateBalanceCache(destination),
+  ]);
+
+  try {
+    const { broadcastToAccount } = await import('./websocket.js');
+    broadcastToAccount(destination, {
+      type: 'balance_update',
+      action: 'payment_received',
+      source: sourcePublicKey,
+      destination,
+      amount,
+      assetCode: assetCode || 'XLM',
+      hash: result.hash,
+    });
+  } catch (wsErr) {
+    logger.warn('stellar.sendPayment.wsNotification.failed', { destination, error: wsErr.message });
+  }
 
   await eventMonitor.publishEvent(sourcePublicKey, {
     type: 'PaymentSent',
-    data: { destination, amount, hash: result.hash },
-    version: 1
+    data: {
+      destination,
+      amount,
+      hash: result.hash,
+      feeBump: usedFeeBump,
+      memo,
+      memoType,
+      correlationId: txCorrelationId,
+    },
+    version: 1,
   });
 
-  // Persist transaction — ensure both users exist first
-  await prisma.$transaction(async (tx) => {
-    const [sender, recipient] = await Promise.all([
-      tx.user.upsert({ where: { publicKey: sourcePublicKey }, update: {}, create: { publicKey: sourcePublicKey } }),
-      tx.user.upsert({ where: { publicKey: destination },    update: {}, create: { publicKey: destination } }),
-    ]);
-    await tx.transaction.create({
-      data: {
-        hash: result.hash,
-        assetCode: assetCode || 'XLM',
-        amount,
-        ledger: result.ledger ?? null,
-        successful: result.successful,
-        senderId: sender.id,
-        recipientId: recipient.id,
-      },
-    });
-  }).catch(err => logger.warn('db.transaction.save.failed', { error: err.message }));
-  
+  await prisma
+    .$transaction(async (tx) => {
+      const [sender, recipient] = await Promise.all([
+        tx.user.upsert({
+          where: { publicKey: sourcePublicKey },
+          update: {},
+          create: { publicKey: sourcePublicKey },
+        }),
+        tx.user.upsert({
+          where: { publicKey: destination },
+          update: {},
+          create: { publicKey: destination },
+        }),
+      ]);
+      await tx.transaction.create({
+        data: {
+          hash: result.hash,
+          assetCode: assetCode || 'XLM',
+          amount,
+          ledger: result.ledger ?? null,
+          successful: result.successful,
+          senderId: sender.id,
+          recipientId: recipient.id,
+          memo: memo ?? null,
+          memoType: memo ? memoType || 'text' : null,
+        },
+      });
+    })
+    .catch((err) =>
+      logger.warn('db.transaction.save.failed', { error: err.message, correlationId: txCorrelationId }),
+    );
+
   return {
     hash: result.hash,
     ledger: result.ledger,
-    success: result.successful
+    success: result.successful,
+    feeBump: usedFeeBump,
   };
 }
 
-export async function createTrustline(sourceSecret, assetCode) {
-  const issuer = getIssuer(assetCode);
+/**
+ * Trustlines
+ * A trustline is an explicit opt-in by an account to hold, send, or receive a
+ * specific non-native asset (e.g. USDC). Without a trustline, an account cannot
+ * receive that asset. This protects users from receiving unwanted or spam tokens
+ * without their consent. The Operation.changeTrust call below creates or updates
+ * the trustline; setting limit to '0' removes it.
+ * @see https://developers.stellar.org/docs/learn/fundamentals/stellar-data-structures/accounts#trustlines
+ *
+ * Create a trustline for a non-XLM asset on an account. No-ops if the trustline already exists.
+ * @param {string} sourceSecret - Secret key of the account adding the trustline
+ * @param {string} assetCode - Asset code to trust (e.g. 'USDC')
+ * @param {string} [assetIssuer] - Optional issuer override; falls back to config/assets.js registry
+ * @param {string|number} [limit] - Optional trust limit; defaults to maximum if omitted
+ * @returns {Promise<{hash?: string, assetCode: string, issuer: string, alreadyExists?: boolean}>}
+ * @throws {Error} If the asset issuer is unknown or Horizon submission fails
+ */
+export async function createTrustline(sourceSecret, assetCode, assetIssuer, limit) {
+  const issuer = assetIssuer || getIssuer(assetCode);
   if (!issuer) throw new Error(`Unknown asset or missing issuer for ${assetCode}`);
 
   const sourceKeypair = StellarSDK.Keypair.fromSecret(sourceSecret);
   const sourcePublicKey = sourceKeypair.publicKey();
-  logger.info('stellar.createTrustline', { publicKey: sourcePublicKey, assetCode });
+  const correlationId = randomUUID();
+  logger.info('stellar.createTrustline', { publicKey: sourcePublicKey, assetCode, correlationId });
 
-  const sourceAccount = await getHorizonServer().loadAccount(sourcePublicKey);
+  const sourceAccount = await withHorizonRetry(() =>
+    getHorizonServer().loadAccount(sourcePublicKey),
+  );
+
+  const alreadyTrusted = sourceAccount.balances.some(
+    (b) => b.asset_code === assetCode && b.asset_issuer === issuer,
+  );
+  if (alreadyTrusted) {
+    logger.info('stellar.createTrustline.exists', { publicKey: sourcePublicKey, assetCode, correlationId });
+    return { alreadyExists: true, assetCode, issuer };
+  }
+
   const asset = new StellarSDK.Asset(assetCode, issuer);
+
+  const changeTrustOpts = { asset };
+  if (limit !== undefined && limit !== null) changeTrustOpts.limit = limit.toString();
 
   const transaction = new StellarSDK.TransactionBuilder(sourceAccount, {
     fee: StellarSDK.BASE_FEE,
-    networkPassphrase: isTestnet() ? StellarSDK.Networks.TESTNET : StellarSDK.Networks.PUBLIC,
+    networkPassphrase: getNetworkPassphrase(),
   })
-    .addOperation(StellarSDK.Operation.changeTrust({ asset }))
+    .addOperation(StellarSDK.Operation.changeTrust(changeTrustOpts))
     .setTimeout(30)
     .build();
 
@@ -179,13 +814,23 @@ export async function createTrustline(sourceSecret, assetCode) {
 
   let result;
   try {
-    result = await getHorizonServer().submitTransaction(transaction);
+    result = await withHorizonRetry(() => getHorizonServer().submitTransaction(transaction));
   } catch (err) {
-    logger.error('stellar.createTrustline.failed', { publicKey: sourcePublicKey, assetCode, error: err.message });
+    logger.error('stellar.createTrustline.failed', {
+      publicKey: sourcePublicKey,
+      assetCode,
+      correlationId,
+      error: err.message,
+    });
     throw err;
   }
 
-  logger.info('stellar.createTrustline.success', { publicKey: sourcePublicKey, assetCode, hash: result.hash });
+  logger.info('stellar.createTrustline.success', {
+    publicKey: sourcePublicKey,
+    assetCode,
+    correlationId,
+    hash: result.hash,
+  });
 
   await eventMonitor.publishEvent(sourcePublicKey, {
     type: 'TrustlineCreated',
@@ -196,77 +841,289 @@ export async function createTrustline(sourceSecret, assetCode) {
   return { hash: result.hash, assetCode, issuer };
 }
 
-export async function getTransactions(publicKey, { cursor, limit = 10, type, dateFrom, dateTo } = {}) {
-  let builder = server.transactions().forAccount(publicKey).order('desc').limit(limit);
-  if (cursor) builder = builder.cursor(cursor);
+/**
+ * Remove an existing trustline from an account. The asset balance must be zero.
+ * @param {string} sourceSecret - Secret key of the account removing the trustline
+ * @param {string} assetCode - Asset code of the trustline to remove
+ * @returns {Promise<{hash: string, assetCode: string, issuer: string}>}
+ * @throws {Error} If the trustline doesn't exist, the balance is non-zero, or submission fails
+ */
+export async function removeTrustline(sourceSecret, assetCode) {
+  const issuer = getIssuer(assetCode);
+  if (!issuer) throw new Error(`Unknown asset or missing issuer for ${assetCode}`);
 
-  const page = await builder.call();
+  const sourceKeypair = StellarSDK.Keypair.fromSecret(sourceSecret);
+  const sourcePublicKey = sourceKeypair.publicKey();
+  const correlationId = randomUUID();
+  logger.info('stellar.removeTrustline', { publicKey: sourcePublicKey, assetCode, correlationId });
 
-  let records = await Promise.all(
-    page.records.map(async (tx) => {
-      const ops = await tx.operations();
-      const op = ops.records[0];
-      const opType = op?.type ?? 'unknown';
-      const amount = op?.amount ?? null;
-      const asset = op?.asset_type === 'native' ? 'XLM'
-        : op?.asset_code ? `${op.asset_code}` : null;
-      const counterparty = opType === 'payment'
-        ? (op.from === publicKey ? op.to : op.from)
-        : null;
-      const direction = opType === 'payment'
-        ? (op.from === publicKey ? 'sent' : 'received')
-        : null;
-
-      return {
-        id: tx.id,
-        hash: tx.hash,
-        type: opType,
-        direction,
-        amount,
-        asset,
-        counterparty,
-        date: tx.created_at,
-        fee: tx.fee_charged,
-        successful: tx.successful,
-        memo: tx.memo ?? null,
-        cursor: tx.paging_token,
-      };
-    })
+  const sourceAccount = await withHorizonRetry(() =>
+    getHorizonServer().loadAccount(sourcePublicKey),
   );
 
-  if (type) records = records.filter(r => r.type === type);
-  if (dateFrom) records = records.filter(r => new Date(r.date) >= new Date(dateFrom));
-  if (dateTo) records = records.filter(r => new Date(r.date) <= new Date(dateTo));
+  const balance = sourceAccount.balances.find(
+    (b) => b.asset_code === assetCode && b.asset_issuer === issuer,
+  );
+  if (!balance) {
+    throw new Error(`No trustline found for ${assetCode}`);
+  }
+  if (parseFloat(balance.balance) !== 0) {
+    throw new Error(
+      `Cannot remove trustline: balance is non-zero (${balance.balance} ${assetCode})`,
+    );
+  }
+
+  const asset = new StellarSDK.Asset(assetCode, issuer);
+
+  const transaction = new StellarSDK.TransactionBuilder(sourceAccount, {
+    fee: StellarSDK.BASE_FEE,
+    networkPassphrase: getNetworkPassphrase(),
+  })
+    .addOperation(StellarSDK.Operation.changeTrust({ asset, limit: '0' }))
+    .setTimeout(30)
+    .build();
+
+  transaction.sign(sourceKeypair);
+
+  let result;
+  try {
+    result = await withHorizonRetry(() => getHorizonServer().submitTransaction(transaction));
+  } catch (err) {
+    logger.error('stellar.removeTrustline.failed', {
+      publicKey: sourcePublicKey,
+      assetCode,
+      correlationId,
+      error: err.message,
+    });
+    throw err;
+  }
+
+  logger.info('stellar.removeTrustline.success', {
+    publicKey: sourcePublicKey,
+    assetCode,
+    correlationId,
+    hash: result.hash,
+  });
+
+  await eventMonitor.publishEvent(sourcePublicKey, {
+    type: 'TrustlineRemoved',
+    data: { assetCode, issuer, hash: result.hash },
+    version: 1,
+  });
+
+  return { hash: result.hash, assetCode, issuer };
+}
+
+/**
+ * Path Payments
+ * A path payment lets the sender specify one asset to send while the recipient
+ * receives a different asset. The Stellar network automatically routes the
+ * conversion through on-chain order books or AMM liquidity pools to find the
+ * best available exchange rate — no manual swap step required. This is ideal
+ * for cross-currency remittances (e.g. send USDC, recipient receives EUR stablecoin).
+ * Two variants exist: strict-send (fix the send amount, maximise what arrives)
+ * and strict-receive (fix what the recipient gets, minimise what is sent).
+ * Path payment logic for this platform lives in pathPayment.js (sendPathPayment,
+ * findPaths, findPathsStrictReceive).
+ * @see https://developers.stellar.org/docs/learn/fundamentals/transactions/operations-list#path-payment-strict-send
+ */
+
+/**
+ * Map a raw Horizon transaction record into the shape returned to API
+ * consumers. Shared by {@link getTransactions} (paginated listing) and
+ * {@link getTransactionRecordByHash} (direct hash lookup), so both code
+ * paths always return an identically-shaped record.
+ * @param {import('@stellar/stellar-sdk').Horizon.ServerApi.TransactionRecord} tx
+ * @param {string} publicKey - Account the record is being rendered for (used to derive direction/counterparty)
+ */
+async function formatTransactionRecord(tx, publicKey) {
+  const ops = await tx.operations();
+  const op = ops.records[0];
+  const opType = op?.type ?? 'unknown';
+  const amount = op?.amount ?? null;
+  const asset = op?.asset_type === 'native' ? 'XLM' : op?.asset_code ? `${op.asset_code}` : null;
+  const counterparty = opType === 'payment' ? (op.from === publicKey ? op.to : op.from) : null;
+  const direction = opType === 'payment' ? (op.from === publicKey ? 'sent' : 'received') : null;
 
   return {
-    records,
-    nextCursor: page.records.length === limit ? page.records[page.records.length - 1].paging_token : null,
+    id: tx.id,
+    hash: tx.hash,
+    type: opType,
+    direction,
+    amount,
+    asset,
+    counterparty,
+    date: tx.created_at,
+    fee: tx.fee_charged,
+    successful: tx.successful,
+    memo: tx.memo ?? null,
+    cursor: tx.paging_token,
+    ledger: tx.ledger_attr,
+    envelopeXdr: tx.envelope_xdr,
   };
 }
 
-export async function getFeeStats() {
-  const stats = await server.feeStats();
-  const feeStroops = parseInt(stats.fee_charged?.p50 ?? StellarSDK.BASE_FEE);
-  const feeXLM = feeStroops / 1e7;
+/**
+ * Fetch paginated transaction history for an account from Stellar Horizon.
+ * @param {string} publicKey - Stellar public key of the account
+ * @param {object} [options={}]
+ * @param {string} [options.cursor] - Paging token for cursor-based pagination
+ * @param {number} [options.limit=10] - Maximum records per page (max 200)
+ * @param {string} [options.type] - Filter by operation type (e.g. 'payment')
+ * @param {string} [options.dateFrom] - ISO date string; exclude transactions before this date
+ * @param {string} [options.dateTo] - ISO date string; exclude transactions after this date
+ * @returns {Promise<{records: object[], nextCursor: string|null, hasMore: boolean}>}
+ * @throws {Error} If the Horizon API call fails
+ */
+export async function getTransactions(
+  publicKey,
+  { cursor, limit = 10, type, dateFrom, dateTo } = {},
+) {
+  let builder = getHorizonServer().transactions().forAccount(publicKey).order('desc').limit(limit);
+  if (cursor) builder = builder.cursor(cursor);
 
-  // Fetch XLM/USD price via Stellar SDEX (XLM/USDC order book)
-  let xlmUsd = null;
-  try {
-    const usdc = new StellarSDK.Asset('USDC', 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN');
-    const book = await server.orderbook(StellarSDK.Asset.native(), usdc).limit(1).call();
-    const ask = parseFloat(book.asks?.[0]?.price);
-    if (ask > 0) xlmUsd = ask;
-  } catch (_) {}
+  const page = await withHorizonRetry(() => builder.call());
 
-  const feeUsd = xlmUsd ? feeXLM * xlmUsd : null;
+  let records = await Promise.all(page.records.map((tx) => formatTransactionRecord(tx, publicKey)));
+
+  if (type) records = records.filter((r) => r.type === type);
+  if (dateFrom) records = records.filter((r) => new Date(r.date) >= new Date(dateFrom));
+  if (dateTo) records = records.filter((r) => new Date(r.date) <= new Date(dateTo));
 
   return {
-    feeStroops,
-    feeXLM: feeXLM.toFixed(7),
-    feeUsd: feeUsd ? feeUsd.toFixed(6) : null,
-    xlmUsd: xlmUsd ? xlmUsd.toFixed(4) : null,
-    // Traditional wire transfer benchmark for comparison
-    traditionalFeeUsd: 25,
+    records,
+    nextCursor:
+      page.records.length === limit ? page.records[page.records.length - 1].paging_token : null,
+    hasMore: page.records.length === limit,
+  };
+}
+
+/**
+ * Fetch a single transaction directly from Horizon by hash (issue #1122).
+ * Unlike {@link getTransactions}, this does not depend on the transaction
+ * being within the account's most recent page(s) of history — Horizon's
+ * `/transactions/{hash}` endpoint looks it up directly regardless of age.
+ * @param {string} hash - Transaction hash (hex)
+ * @returns {Promise<import('@stellar/stellar-sdk').Horizon.ServerApi.TransactionRecord>}
+ * @throws {Error} With `.response.status === 404` when Horizon has no such transaction
+ */
+export async function getTransactionByHash(hash) {
+  return withHorizonRetry(() => getHorizonServer().transactions().transaction(hash).call());
+}
+
+/**
+ * Determine whether a Horizon transaction record involves the given account,
+ * checking both the transaction's source account and every operation's
+ * relevant account fields (payment from/to, trustline holder, signer, etc.).
+ * @param {import('@stellar/stellar-sdk').Horizon.ServerApi.TransactionRecord} tx
+ * @param {string} publicKey
+ * @returns {Promise<boolean>}
+ */
+export async function transactionInvolvesAccount(tx, publicKey) {
+  if (tx.source_account === publicKey) return true;
+  try {
+    const ops = await tx.operations();
+    return ops.records.some((op) =>
+      [
+        op.source_account,
+        op.from,
+        op.to,
+        op.destination,
+        op.account,
+        op.trustor,
+        op.trustee,
+        op.signer,
+        op.into,
+        op.funder,
+      ].includes(publicKey),
+    );
+  } catch (err) {
+    logger.warn('stellar.transactionInvolvesAccount.failed', {
+      hash: tx?.hash,
+      publicKey,
+      error: err.message,
+    });
+    return false;
+  }
+}
+
+/**
+ * Look up a single transaction by hash directly from Horizon and verify it
+ * belongs to the given account before returning it (issue #1122).
+ * @param {string} hash
+ * @param {string} publicKey
+ * @returns {Promise<object>} Formatted transaction record (see {@link formatTransactionRecord})
+ * @throws {Error} `.notFoundReason === 'horizon'` if Horizon has no such transaction,
+ *   or `.notFoundReason === 'account_mismatch'` if it exists but doesn't involve `publicKey`
+ */
+export async function getTransactionRecordByHash(hash, publicKey) {
+  let tx;
+  try {
+    tx = await getTransactionByHash(hash);
+  } catch (err) {
+    if (err?.response?.status === 404) {
+      const notFound = new Error('Transaction not found');
+      notFound.notFoundReason = 'horizon';
+      throw notFound;
+    }
+    throw err;
+  }
+
+  const belongs = await transactionInvolvesAccount(tx, publicKey);
+  if (!belongs) {
+    const notFound = new Error('Transaction not found for this account');
+    notFound.notFoundReason = 'account_mismatch';
+    throw notFound;
+  }
+
+  return formatTransactionRecord(tx, publicKey);
+}
+
+/**
+ * Retrieve current network fee statistics from Horizon with an XLM/USD conversion via the SDEX.
+ * @returns {Promise<{feeStroops: number, feeXLM: string, feeUsd: string|null, xlmUsd: string|null,
+ *   traditionalFeeUsd: number}>}
+ * @throws {Error} If the Horizon feeStats call fails
+ */
+export async function getFeeStats() {
+  return withSpan('stellar-service', 'stellar.getFeeStats', async () => {
+    const stats = await withHorizonRetry(() => getHorizonServer().feeStats());
+    const feeStroops = parseInt(stats.fee_charged?.p50 ?? StellarSDK.BASE_FEE);
+    const feeXLM = feeStroops / 1e7;
+
+    let xlmUsd = null;
+    try {
+      const usdc = new StellarSDK.Asset('USDC', getIssuer('USDC'));
+      const book = await withHorizonRetry(() =>
+        getHorizonServer().orderbook(StellarSDK.Asset.native(), usdc).limit(1).call(),
+      );
+      const ask = parseFloat(book.asks?.[0]?.price);
+      if (ask > 0) xlmUsd = ask;
+    } catch (_) {
+      /* non-critical: XLM/USD price lookup failure */
+    }
+
+    const feeUsd = xlmUsd ? feeXLM * xlmUsd : null;
+
+    return {
+      feeStroops,
+      feeXLM: feeXLM.toFixed(7),
+      feeUsd: feeUsd ? feeUsd.toFixed(6) : null,
+      xlmUsd: xlmUsd ? xlmUsd.toFixed(4) : null,
+      traditionalFeeUsd: 25,
+    };
+  });
+}
+
+/**
+ * Fetch a page of an account's transaction history from Horizon.
+ * @param {string} publicKey - Stellar public key of the account
+ * @param {object} [options]
+ * @param {number} [options.limit=10] - Max records to return
+ * @param {string} [options.cursor] - Paging token to continue from
+ * @returns {Promise<{publicKey: string, transactions: Array<{id: string, hash: string, createdAt: string, successful: boolean, ledger: number, pagingToken: string}>, nextCursor: string|null}>} Transaction page and next cursor
+ * @throws {Error} If the Horizon call fails
+ */
 export async function getTransactionHistory(publicKey, { limit = 10, cursor } = {}) {
   let call = getHorizonServer().transactions().forAccount(publicKey).limit(limit).order('desc');
   if (cursor) call = call.cursor(cursor);
@@ -285,12 +1142,24 @@ export async function getTransactionHistory(publicKey, { limit = 10, cursor } = 
   };
 }
 
+/**
+ * Look up the best ask price between two assets using the Stellar SDEX order book.
+ * @param {string} from - Source asset code (e.g. 'XLM')
+ * @param {string} to - Destination asset code (e.g. 'USDC')
+ * @returns {Promise<number|null>} Best ask price, or null if unavailable
+ * @example
+ * const rate = await getExchangeRate('XLM', 'USDC'); // e.g. 0.12
+ */
 export async function getExchangeRate(from, to) {
   if (from === to) return 1.0;
   try {
-    const fromAsset = from === 'XLM' ? StellarSDK.Asset.native() : new StellarSDK.Asset(from, getIssuer(from));
-    const toAsset   = to   === 'XLM' ? StellarSDK.Asset.native() : new StellarSDK.Asset(to,   getIssuer(to));
-    const orderbook = await server.orderbook(fromAsset, toAsset).call();
+    const fromAsset =
+      from === 'XLM' ? StellarSDK.Asset.native() : new StellarSDK.Asset(from, getIssuer(from));
+    const toAsset =
+      to === 'XLM' ? StellarSDK.Asset.native() : new StellarSDK.Asset(to, getIssuer(to));
+    const orderbook = await withHorizonRetry(() =>
+      getHorizonServer().orderbook(fromAsset, toAsset).call(),
+    );
     const bestAsk = orderbook.asks?.[0]?.price;
     return bestAsk ? parseFloat(bestAsk) : null;
   } catch (err) {
@@ -299,30 +1168,398 @@ export async function getExchangeRate(from, to) {
   }
 }
 
+/**
+ * Check the configured Horizon server's liveness and return network metadata.
+ * @returns {Promise<{network: string, horizonUrl: string, online: boolean, horizonVersion?: string, networkPassphrase?: string, currentProtocolVersion?: number}>}
+ */
 export async function getNetworkStatus() {
-  const { horizonUrl } = getConfig().stellar;
-  try {
-    const root = await getHorizonServer().root();
-    const status = {
-      network: isTestnet() ? 'testnet' : 'mainnet',
-      horizonUrl,
-    const root = await server.root();
-    const status = {
-      network: isTestnet ? 'testnet' : 'mainnet',
-      horizonUrl: process.env.HORIZON_URL,
-      online: true,
-      horizonVersion: root.horizon_version,
-      networkPassphrase: root.network_passphrase,
-      currentProtocolVersion: root.current_protocol_version,
-    };
-    logger.debug('stellar.networkStatus', status);
-    return status;
-  } catch (err) {
-    logger.warn('stellar.networkStatus.offline', { error: err.message });
-    return {
-      network: isTestnet() ? 'testnet' : 'mainnet',
-      horizonUrl,
-      online: false,
-    };
+  return withSpan('stellar-service', 'stellar.getNetworkStatus', async (span) => {
+    const { horizonUrl } = getConfig().stellar;
+    span.setAttribute('stellar.horizonUrl', horizonUrl);
+    try {
+      const root = await withHorizonRetry(() => getHorizonServer().root());
+      const status = {
+        network: getConfig().stellar.network,
+        horizonUrl,
+        online: true,
+        horizonVersion: root.horizon_version,
+        networkPassphrase: root.network_passphrase,
+        currentProtocolVersion: root.current_protocol_version,
+      };
+      logger.debug('stellar.networkStatus', status);
+      return status;
+    } catch (err) {
+      logger.warn('stellar.networkStatus.offline', { error: err.message });
+      return {
+        network: getConfig().stellar.network,
+        horizonUrl,
+        online: false,
+      };
+    }
+  });
+}
+
+/**
+ * Get network status with fee surge detection.
+ * Compares current fee to 7-day average and determines if network is experiencing surge.
+ * @returns {Promise<{network: string, horizonUrl: string, online: boolean, feeStroops: number, feeXLM: string, sevenDayAverageFeeStroops?: number, feeSurge: boolean, feeSurgeRatio: number, status: 'ok'|'degraded'|'offline'}>}
+ */
+export async function getNetworkStatusWithFeeSurge() {
+  const status = await getNetworkStatus();
+  let feeStroops = 100;
+  let feeXLM = '0.0000100';
+  let sevenDayAverageFeeStroops = null;
+  let feeSurge = false;
+  let feeSurgeRatio = 1;
+
+  if (status.online) {
+    try {
+      const stats = await withHorizonRetry(() => getHorizonServer().feeStats());
+      feeStroops = parseInt(stats.fee_charged?.p50 ?? stats.last_ledger_base_fee ?? '100', 10);
+      feeXLM = (feeStroops / 1e7).toFixed(7);
+      recordFeeSample(feeStroops);
+      sevenDayAverageFeeStroops = getSevenDayAverageFee();
+      const surgeInfo = detectFeeSurge(feeStroops, sevenDayAverageFeeStroops);
+      feeSurge = surgeInfo.surge;
+      feeSurgeRatio = surgeInfo.ratio;
+    } catch (error) {
+      logger.warn('stellar.feeSurgeDetection.failed', { error: error.message });
+    }
   }
+
+  return {
+    ...status,
+    feeStroops,
+    feeXLM,
+    sevenDayAverageFeeStroops: sevenDayAverageFeeStroops ? Math.round(sevenDayAverageFeeStroops) : null,
+    feeSurge,
+    feeSurgeRatio,
+    status: !status.online ? 'offline' : feeSurge ? 'degraded' : 'ok',
+  };
+}
+
+// Horizon latency monitor: pings the Horizon root endpoint on an interval
+// and caches the round-trip time so /network/status and /health/latency can
+// return the last measurement without adding a request on the hot path.
+const LATENCY_PING_INTERVAL_MS = 30000;
+let lastLatencyMeasurement = null;
+let latencyPingTimer = null;
+
+/**
+ * Measure a single round-trip to the Horizon root endpoint and cache the result.
+ * @returns {Promise<{latencyMs: number|null, horizonUrl: string, online: boolean, measuredAt: string}>} The measurement, also cached for {@link getLastHorizonLatency}
+ */
+export async function pingHorizonLatency() {
+  const { horizonUrl } = getConfig().stellar;
+  const startedAt = Date.now();
+  try {
+    await getHorizonServer().root();
+    lastLatencyMeasurement = { latencyMs: Date.now() - startedAt, horizonUrl, online: true, measuredAt: new Date().toISOString() };
+  } catch (err) {
+    logger.warn('stellar.latencyPing.failed', { error: err.message });
+    lastLatencyMeasurement = { latencyMs: null, horizonUrl, online: false, measuredAt: new Date().toISOString() };
+  }
+  return lastLatencyMeasurement;
+}
+
+/**
+ * Get the most recent Horizon latency measurement without performing a new ping.
+ * @returns {{latencyMs: number|null, horizonUrl: string, online: boolean, measuredAt: string}|null} Last measurement, or null if none has been taken yet
+ */
+export function getLastHorizonLatency() {
+  return lastLatencyMeasurement;
+}
+
+/**
+ * Start periodically pinging Horizon to keep the latency measurement fresh.
+ * A no-op if the monitor is already running. The timer is unref'd so it
+ * doesn't keep the process alive.
+ * @param {number} [intervalMs=LATENCY_PING_INTERVAL_MS] - Ping interval in ms
+ * @returns {NodeJS.Timeout} The interval timer (existing one if already running)
+ */
+export function startHorizonLatencyMonitor(intervalMs = LATENCY_PING_INTERVAL_MS) {
+  if (latencyPingTimer) return latencyPingTimer;
+  pingHorizonLatency();
+  latencyPingTimer = setInterval(pingHorizonLatency, intervalMs);
+  latencyPingTimer.unref?.();
+  return latencyPingTimer;
+}
+
+/**
+ * Stop the periodic Horizon latency ping started by {@link startHorizonLatencyMonitor}.
+ * @returns {void}
+ */
+export function stopHorizonLatencyMonitor() {
+  if (latencyPingTimer) clearInterval(latencyPingTimer);
+  latencyPingTimer = null;
+}
+
+/**
+ * List all non-native trustlines held by an account.
+ * @param {string} publicKey - Stellar public key of the account
+ * @returns {Promise<Array<{assetCode: string, issuer: string, balance: string, limit: string, authorized: boolean}>>}
+ * @throws {Error} If the account does not exist on the network
+ */
+export async function getTrustlines(publicKey) {
+  logger.debug('stellar.getTrustlines', { publicKey });
+  const account = await withHorizonRetry(() => getHorizonServer().loadAccount(publicKey));
+  return account.balances
+    .filter((b) => b.asset_type !== 'native')
+    .map((b) => ({
+      assetCode: b.asset_code,
+      issuer: b.asset_issuer,
+      balance: b.balance,
+      limit: b.limit,
+      authorized: b.is_authorized === true,
+    }));
+}
+
+/**
+ * Update the limit on an existing trustline.
+ * @param {string} sourceSecret - Secret key of the account owning the trustline
+ * @param {string} assetCode - Asset code of the trustline to update
+ * @param {string} assetIssuer - Issuer public key of the asset
+ * @param {string|number} newLimit - New trust limit (must be >= current balance)
+ * @returns {Promise<{hash: string, assetCode: string, issuer: string, newLimit: string}>}
+ * @throws {Error} If newLimit is invalid or Horizon submission fails
+ */
+export async function updateTrustlineLimit(sourceSecret, assetCode, assetIssuer, newLimit) {
+  const issuer = assetIssuer || getIssuer(assetCode);
+  if (!issuer) throw new Error(`Unknown asset or missing issuer for ${assetCode}`);
+
+  const limitNum = parseFloat(newLimit);
+  if (isNaN(limitNum) || limitNum < 0) throw new Error('newLimit must be a non-negative number');
+
+  const sourceKeypair = StellarSDK.Keypair.fromSecret(sourceSecret);
+  const sourcePublicKey = sourceKeypair.publicKey();
+  const correlationId = randomUUID();
+  logger.info('stellar.updateTrustlineLimit', { publicKey: sourcePublicKey, assetCode, newLimit, correlationId });
+
+  const sourceAccount = await withHorizonRetry(() => getHorizonServer().loadAccount(sourcePublicKey));
+
+  const asset = new StellarSDK.Asset(assetCode, issuer);
+  const transaction = new StellarSDK.TransactionBuilder(sourceAccount, {
+    fee: StellarSDK.BASE_FEE,
+    networkPassphrase: getNetworkPassphrase(),
+  })
+    .addOperation(StellarSDK.Operation.changeTrust({ asset, limit: newLimit.toString() }))
+    .setTimeout(30)
+    .build();
+
+  transaction.sign(sourceKeypair);
+
+  let result;
+  try {
+    result = await withHorizonRetry(() => getHorizonServer().submitTransaction(transaction));
+  } catch (err) {
+    logger.error('stellar.updateTrustlineLimit.failed', { publicKey: sourcePublicKey, assetCode, correlationId, error: err.message });
+    throw err;
+  }
+
+  logger.info('stellar.updateTrustlineLimit.success', { publicKey: sourcePublicKey, assetCode, correlationId, hash: result.hash });
+
+  await eventMonitor.publishEvent(sourcePublicKey, {
+    type: 'TrustlineLimitUpdated',
+    data: { assetCode, issuer, newLimit: newLimit.toString(), hash: result.hash },
+    version: 1,
+  });
+
+  return { hash: result.hash, assetCode, issuer, newLimit: newLimit.toString() };
+}
+
+/**
+ * Create trustlines for multiple assets in sequence, collecting per-asset success/failure.
+ * Skips assets that already have an existing trustline (alreadyExists).
+ * @param {string} sourceSecret - Secret key of the account creating trustlines
+ * @param {Array<{code: string, issuer?: string, limit?: string|number}>} assets - Assets to trust
+ * @returns {Promise<Array<{success: boolean, assetCode: string, issuer: string, hash?: string, alreadyExists?: boolean, error?: string}>>}
+ */
+export async function batchCreateTrustlines(sourceSecret, assets) {
+  const results = [];
+  for (const asset of assets) {
+    try {
+      const result = await createTrustline(sourceSecret, asset.code, asset.issuer, asset.limit);
+      results.push({ success: true, assetCode: asset.code, issuer: result.issuer, ...result });
+    } catch (err) {
+      results.push({ success: false, assetCode: asset.code, issuer: asset.issuer ?? null, error: err.message });
+    }
+  }
+  return results;
+}
+
+/**
+ * Merge a Stellar account into a destination account, transferring all remaining XLM and closing the source.
+ * All trustlines and non-XLM balances must be removed before merging.
+ * @param {string} sourceSecret - Secret key of the account to merge (will be closed)
+ * @param {string} destination - Stellar public key of the receiving account
+ * @returns {Promise<{hash: string, ledger: number, success: boolean}>}
+ * @throws {Error} If the account has non-zero non-XLM balances or Horizon submission fails
+ */
+export async function mergeAccount(sourceSecret, destination) {
+  const sourceKeypair = StellarSDK.Keypair.fromSecret(sourceSecret);
+  const sourcePublicKey = sourceKeypair.publicKey();
+  const correlationId = randomUUID();
+  logger.info('stellar.mergeAccount.start', { source: sourcePublicKey, destination, correlationId });
+
+  const sourceAccount = await withHorizonRetry(() =>
+    getHorizonServer().loadAccount(sourcePublicKey),
+  );
+
+  const transaction = new StellarSDK.TransactionBuilder(sourceAccount, {
+    fee: StellarSDK.BASE_FEE,
+    networkPassphrase: getNetworkPassphrase(),
+  })
+    .addOperation(StellarSDK.Operation.accountMerge({ destination }))
+    .setTimeout(30)
+    .build();
+
+  transaction.sign(sourceKeypair);
+
+  let result;
+  try {
+    result = await withHorizonRetry(() => getHorizonServer().submitTransaction(transaction));
+  } catch (err) {
+    logger.error('stellar.mergeAccount.failed', {
+      source: sourcePublicKey,
+      destination,
+      correlationId,
+      error: err.message,
+    });
+    throw err;
+  }
+
+  logger.info('stellar.mergeAccount.success', {
+    source: sourcePublicKey,
+    destination,
+    correlationId,
+    hash: result.hash,
+    ledger: result.ledger,
+  });
+
+  await eventMonitor.publishEvent(sourcePublicKey, {
+    type: 'AccountMerged',
+    data: { destination, hash: result.hash },
+    version: 1,
+  });
+
+  return {
+    hash: result.hash,
+    ledger: result.ledger,
+    success: result.successful,
+  };
+}
+
+/**
+ * List all open DEX offers for an account.
+ * @param {string} publicKey - Stellar public key of the account
+ * @returns {Promise<Array<object>>} Raw Horizon offer records (empty array if none or on lookup failure)
+ */
+export async function getOpenOffers(publicKey) {
+  try {
+    const offersResponse = await withHorizonRetry(() =>
+      getHorizonServer().offers().forAccount(publicKey).call(),
+    );
+    return offersResponse.records || [];
+  } catch {
+    // No offers or error loading them — treat as none rather than failing the caller.
+    return [];
+  }
+}
+
+/**
+ * Simulate an account merge operation to show expected outcomes
+ * @param {string} sourcePublicKey - Public key of source account
+ * @param {string} destinationPublicKey - Public key of destination account
+ * @returns {Promise<{account, offers, blockedReasons}>}
+ */
+export async function simulateMergeAccount(sourcePublicKey, destinationPublicKey) {
+  const sourceAccount = await withHorizonRetry(() =>
+    getHorizonServer().loadAccount(sourcePublicKey),
+  );
+
+  // Get all offers for this account
+  const offers = await getOpenOffers(sourcePublicKey);
+
+  return {
+    account: sourceAccount,
+    offers,
+  };
+}
+
+/**
+ * Build an unsigned XDR transaction envelope for a payment without submitting it to the network.
+ * Useful for multisig workflows and hardware wallet signing.
+ * @param {string} sourceSecret - Secret key of the source account (for sequence number)
+ * @param {string} destination - Stellar public key of the recipient
+ * @param {string} amount - Amount in stroops
+ * @param {string} assetCode - Asset code (default: 'XLM')
+ * @param {string} memo - Optional memo
+ * @param {string} memoType - Type of memo ('text', 'id', 'hash', 'return')
+ * @returns {Promise<{xdr: string}>} Base64-encoded unsigned transaction envelope
+ */
+export async function buildUnsignedXdr(
+  sourceSecret,
+  destination,
+  amount,
+  assetCode = 'XLM',
+  memo = null,
+  memoType = 'text',
+) {
+  validateMemo(memo, memoType);
+
+  const sourceKeypair = StellarSDK.Keypair.fromSecret(sourceSecret);
+  const sourcePublicKey = sourceKeypair.publicKey();
+
+  const sourceAccount = await withHorizonRetry(() =>
+    getHorizonServer().loadAccount(sourcePublicKey),
+  );
+
+  if (assetCode !== 'XLM' && !getIssuer(assetCode)) {
+    throw new Error('ASSET_ISSUER is required for non-XLM payments');
+  }
+
+  const asset =
+    assetCode === 'XLM'
+      ? StellarSDK.Asset.native()
+      : new StellarSDK.Asset(assetCode, getIssuer(assetCode));
+
+  const txBuilder = new StellarSDK.TransactionBuilder(sourceAccount, {
+    fee: StellarSDK.BASE_FEE,
+    networkPassphrase: getNetworkPassphrase(),
+  }).addOperation(
+    StellarSDK.Operation.payment({
+      destination,
+      asset,
+      amount: amount.toString(),
+    }),
+  );
+
+  if (memo) {
+    let stellarMemo;
+    switch (memoType) {
+      case 'id':
+        stellarMemo = StellarSDK.Memo.id(memo);
+        break;
+      case 'hash':
+        stellarMemo = StellarSDK.Memo.hash(memo);
+        break;
+      case 'return':
+        stellarMemo = StellarSDK.Memo.return(memo);
+        break;
+      case 'text':
+      default:
+        stellarMemo = StellarSDK.Memo.text(memo);
+        break;
+    }
+    txBuilder.addMemo(stellarMemo);
+  }
+
+  const transaction = txBuilder.setTimeout(30).build();
+  return {
+    xdr: transaction.toEnvelope().toXDR('base64'),
+  };
+}
+
+export function getInteractiveCircuitBreakerState() {
+  return stellarInteractiveBreaker.getState();
 }

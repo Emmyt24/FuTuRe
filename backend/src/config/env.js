@@ -7,6 +7,9 @@ import { maybeDecryptEnvValue } from './secrets.js';
 
 export const CONFIG_SCHEMA_VERSION = 1;
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+
 const emitter = new EventEmitter();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -57,6 +60,18 @@ function scheduleReload() {
   reloadTimer.unref?.();
 }
 
+export const LOCAL_APP_ENVS = new Set(['development', 'test']);
+export const RECOGNIZED_APP_ENVS = ['development', 'test', 'staging', 'production'];
+export const DEFAULT_JWT_SECRET_LITERAL = 'secret';
+
+function isLocalAppEnv(appEnv) {
+  return LOCAL_APP_ENVS.has(appEnv);
+}
+
+function requiresDeployedSecrets(appEnv) {
+  return !isLocalAppEnv(appEnv);
+}
+
 function normalizeAppEnv(value) {
   const raw = typeof value === 'string' ? value.trim().toLowerCase() : '';
   if (!raw) return 'development';
@@ -75,6 +90,15 @@ function parseInteger(value, { envVarName, defaultValue } = {}) {
   const num = Number.parseInt(String(value), 10);
   if (!Number.isFinite(num)) {
     throw new Error(`${envVarName} must be an integer`);
+  }
+  return num;
+}
+
+function parseFloatEnv(value, { envVarName, defaultValue } = {}) {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  const num = Number.parseFloat(String(value));
+  if (!Number.isFinite(num)) {
+    throw new Error(`${envVarName} must be a number`);
   }
   return num;
 }
@@ -183,9 +207,9 @@ function parseStellarNetwork(raw, { appEnv, envVarName }) {
   const normalized = value.toLowerCase();
 
   if (normalized === 'public') return 'mainnet';
-  if (normalized === 'mainnet' || normalized === 'testnet') return normalized;
+  if (normalized === 'mainnet' || normalized === 'testnet' || normalized === 'futurenet') return normalized;
 
-  throw new Error(`${envVarName} must be "testnet" or "mainnet"`);
+  throw new Error(`${envVarName} must be "testnet", "futurenet", or "mainnet"`);
 }
 
 function assertValidPort(port, { envVarName }) {
@@ -210,6 +234,22 @@ function requiredString(value, { envVarName }) {
   return value.trim();
 }
 
+function validateRequiredSecrets(env) {
+  const requiredSecrets = ['STREAM_SECRET_ENCRYPTION_KEY', 'DATABASE_URL'];
+  const missing = [];
+
+  for (const secret of requiredSecrets) {
+    const value = env[secret];
+    if (typeof value !== 'string' || value.trim().length === 0) {
+      missing.push(secret);
+    }
+  }
+
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+  }
+}
+
 export function createConfigFromEnv(env, { appEnv, nodeEnv, loadedEnvFiles } = {}) {
   const resolvedAppEnv = normalizeAppEnv(appEnv || env.APP_ENV || env.NODE_ENV || 'development');
   const resolvedNodeEnv =
@@ -227,8 +267,19 @@ export function createConfigFromEnv(env, { appEnv, nodeEnv, loadedEnvFiles } = {
     );
   }
 
+  // Validate required secrets at startup
+  validateRequiredSecrets(env);
+
   const port = parseInteger(env.PORT, { envVarName: 'PORT', defaultValue: 3001 });
   assertValidPort(port, { envVarName: 'PORT' });
+
+  const trustProxyHops = parseInteger(env.TRUST_PROXY_HOPS, {
+    envVarName: 'TRUST_PROXY_HOPS',
+    defaultValue: 0,
+  });
+  if (!Number.isInteger(trustProxyHops) || trustProxyHops < 0) {
+    throw new Error('TRUST_PROXY_HOPS must be a non-negative integer');
+  }
 
   const stellarNetwork = parseStellarNetwork(env.STELLAR_NETWORK, {
     appEnv: resolvedAppEnv,
@@ -236,7 +287,11 @@ export function createConfigFromEnv(env, { appEnv, nodeEnv, loadedEnvFiles } = {
   });
 
   const defaultHorizonUrl =
-    stellarNetwork === 'testnet' ? 'https://horizon-testnet.stellar.org' : 'https://horizon.stellar.org';
+    stellarNetwork === 'testnet'
+      ? 'https://horizon-testnet.stellar.org'
+      : stellarNetwork === 'futurenet'
+        ? 'https://horizon-futurenet.stellar.org'
+        : 'https://horizon.stellar.org';
 
   const horizonUrl = maybeDecryptEnvValue(env.HORIZON_URL ?? defaultHorizonUrl, encryptionKey, {
     envVarName: 'HORIZON_URL',
@@ -249,6 +304,36 @@ export function createConfigFromEnv(env, { appEnv, nodeEnv, loadedEnvFiles } = {
       ? maybeDecryptEnvValue(assetIssuerRaw.trim(), encryptionKey, { envVarName: 'ASSET_ISSUER' })
       : undefined;
 
+  const defaultSorobanRpcUrl =
+    stellarNetwork === 'testnet'
+      ? 'https://soroban-testnet.stellar.org'
+      : stellarNetwork === 'futurenet'
+        ? 'https://rpc-futurenet.stellar.org'
+        : 'https://mainnet.sorobanrpc.com';
+
+  const sorobanRpcUrl = maybeDecryptEnvValue(env.SOROBAN_RPC_URL ?? defaultSorobanRpcUrl, encryptionKey, {
+    envVarName: 'SOROBAN_RPC_URL',
+  });
+  assertValidUrl(sorobanRpcUrl, { envVarName: 'SOROBAN_RPC_URL' });
+
+  const signingKeyRaw = typeof env.STELLAR_SIGNING_KEY === 'string' ? env.STELLAR_SIGNING_KEY : '';
+  const signingKey = maybeDecryptEnvValue(signingKeyRaw, encryptionKey, {
+    envVarName: 'STELLAR_SIGNING_KEY',
+  }).trim();
+  if (!signingKey && stellarNetwork !== 'testnet') {
+    // Non-fatal: a deployment can still boot, but wallets/anchors that fetch our
+    // stellar.toml will see an empty SIGNING_KEY, which they'll treat as
+    // present-but-invalid rather than "not configured". See issue #954.
+    console.warn(
+      '[config] STELLAR_SIGNING_KEY is not set on a non-testnet network — the published stellar.toml SIGNING_KEY field will be empty.'
+    );
+  }
+
+  const serverBaseUrl = maybeDecryptEnvValue(env.SERVER_BASE_URL ?? 'http://localhost:3001', encryptionKey, {
+    envVarName: 'SERVER_BASE_URL',
+  });
+  assertValidUrl(serverBaseUrl, { envVarName: 'SERVER_BASE_URL' });
+
   const allowedOriginsFromEnv = parseCsv(
     maybeDecryptEnvValue(env.ALLOWED_ORIGINS, encryptionKey, { envVarName: 'ALLOWED_ORIGINS' })
   );
@@ -256,17 +341,26 @@ export function createConfigFromEnv(env, { appEnv, nodeEnv, loadedEnvFiles } = {
   const allowedOrigins =
     allowedOriginsFromEnv.length > 0 ? allowedOriginsFromEnv : allowedOriginsDefault;
 
-  if (resolvedAppEnv === 'production' && allowedOriginsFromEnv.length === 0) {
-    throw new Error('ALLOWED_ORIGINS is required in production');
+  // Unrecognized APP_ENV values (preprod, demo, typos) are allowed to boot
+  // but are treated as deployed: fail-closed on secrets rather than falling
+  // back to development defaults. Recognized values: development, test,
+  // staging, production.
+
+  if (requiresDeployedSecrets(resolvedAppEnv) && allowedOriginsFromEnv.length === 0) {
+    throw new Error('ALLOWED_ORIGINS is required in production and staging');
   }
 
   const jwtSecretRaw =
-    typeof env.JWT_SECRET === 'string' ? env.JWT_SECRET : resolvedAppEnv === 'production' ? '' : 'secret';
+    typeof env.JWT_SECRET === 'string'
+      ? env.JWT_SECRET
+      : isLocalAppEnv(resolvedAppEnv)
+        ? DEFAULT_JWT_SECRET_LITERAL
+        : '';
   const jwtSecret = maybeDecryptEnvValue(jwtSecretRaw, encryptionKey, { envVarName: 'JWT_SECRET' });
-  if (resolvedAppEnv === 'production') {
+  if (requiresDeployedSecrets(resolvedAppEnv)) {
     const secret = requiredString(jwtSecret, { envVarName: 'JWT_SECRET' });
-    if (secret === 'secret') {
-      throw new Error('JWT_SECRET must not be the default value in production');
+    if (secret === DEFAULT_JWT_SECRET_LITERAL) {
+      throw new Error('JWT_SECRET must not be the default value in production or staging');
     }
   }
 
@@ -283,6 +377,29 @@ export function createConfigFromEnv(env, { appEnv, nodeEnv, loadedEnvFiles } = {
   const watchFlag = parseBoolean(env.CONFIG_WATCH);
   const watchEnabled = resolvedAppEnv !== 'test' && watchFlag;
 
+  const dbPoolMax = parseInteger(env.DB_POOL_MAX, {
+    envVarName: 'DB_POOL_MAX',
+    defaultValue: 10,
+  });
+  if (!Number.isInteger(dbPoolMax) || dbPoolMax <= 0) {
+    throw new Error('DB_POOL_MAX must be a positive integer');
+  }
+
+  const alertEmail = env.ALERT_EMAIL ? (typeof env.ALERT_EMAIL === 'string' ? env.ALERT_EMAIL.trim() : '') : undefined;
+  const slackWebhookUrl = env.SLACK_WEBHOOK_URL ? (typeof env.SLACK_WEBHOOK_URL === 'string' ? env.SLACK_WEBHOOK_URL.trim() : '') : undefined;
+
+  // Default XLM amount above which the frontend requires a WebAuthn
+  // biometric re-auth before a payment is confirmed (see issue #808).
+  // Operators can raise/lower the sane default; users may further
+  // customize their own threshold via account settings.
+  const biometricReauthThresholdXLM = parseFloatEnv(env.BIOMETRIC_REAUTH_THRESHOLD_XLM, {
+    envVarName: 'BIOMETRIC_REAUTH_THRESHOLD_XLM',
+    defaultValue: 100,
+  });
+  if (biometricReauthThresholdXLM <= 0) {
+    throw new Error('BIOMETRIC_REAUTH_THRESHOLD_XLM must be a positive number');
+  }
+
   return {
     meta: {
       schemaVersion: CONFIG_SCHEMA_VERSION,
@@ -297,6 +414,7 @@ export function createConfigFromEnv(env, { appEnv, nodeEnv, loadedEnvFiles } = {
     },
     server: {
       port,
+      trustProxyHops,
     },
     cors: {
       allowedOrigins,
@@ -305,6 +423,9 @@ export function createConfigFromEnv(env, { appEnv, nodeEnv, loadedEnvFiles } = {
       network: stellarNetwork,
       horizonUrl,
       assetIssuer,
+      sorobanRpcUrl,
+      signingKey,
+      serverBaseUrl,
     },
     security: {
       jwtSecret,
@@ -314,6 +435,90 @@ export function createConfigFromEnv(env, { appEnv, nodeEnv, loadedEnvFiles } = {
     database: {
       url: env.DATABASE_URL,
       readUrl: env.DATABASE_READ_URL || env.DATABASE_URL,
+      biometricReauthThresholdXLM,
+    },
+    database: {
+      poolMax: dbPoolMax,
+    },
+    alerts: {
+      email: alertEmail,
+      slackWebhookUrl,
+    },
+    aml: {
+      largeThreshold: parseFloatEnv(env.AML_LARGE_TX_THRESHOLD, {
+        envVarName: 'AML_LARGE_TX_THRESHOLD',
+        defaultValue: 10000,
+      }),
+      structuringThreshold: parseFloatEnv(env.AML_STRUCTURING_THRESHOLD, {
+        envVarName: 'AML_STRUCTURING_THRESHOLD',
+        defaultValue: 1000,
+      }),
+      structuringCount: parseInteger(env.AML_STRUCTURING_COUNT, {
+        envVarName: 'AML_STRUCTURING_COUNT',
+        defaultValue: 3,
+      }),
+      velocityLimit: parseFloatEnv(env.AML_VELOCITY_LIMIT, {
+        envVarName: 'AML_VELOCITY_LIMIT',
+        defaultValue: 10000,
+      }),
+      rapidTxCount: parseInteger(env.AML_RAPID_TX_COUNT, {
+        envVarName: 'AML_RAPID_TX_COUNT',
+        defaultValue: 5,
+      }),
+      rapidTxWindowMs: parseInteger(env.AML_RAPID_TX_WINDOW_MS, {
+        envVarName: 'AML_RAPID_TX_WINDOW_MS',
+        defaultValue: HOUR_MS,
+      }),
+      nearThresholdLow: parseFloatEnv(env.AML_NEAR_THRESHOLD_LOW, {
+        envVarName: 'AML_NEAR_THRESHOLD_LOW',
+        defaultValue: 9000,
+      }),
+      sanctionsApiKey: env.SANCTIONS_API_KEY || '',
+      sanctionsApiUrl: env.SANCTIONS_API_URL || 'https://api.ofac-api.com/v4/search',
+      sanctionsMinScore: parseInteger(env.SANCTIONS_MIN_SCORE, {
+        envVarName: 'SANCTIONS_MIN_SCORE',
+        defaultValue: 85,
+      }),
+    },
+    backup: {
+      encryptionKey: env.BACKUP_ENC_KEY || '',
+      encryptionKeyPrevious: env.BACKUP_ENC_KEY_PREVIOUS || '',
+      directory: env.BACKUP_DIR || './backups',
+      intervalHours: parseInteger(env.BACKUP_INTERVAL_HOURS, {
+        envVarName: 'BACKUP_INTERVAL_HOURS',
+        defaultValue: 24,
+      }),
+      retentionDays: parseInteger(env.BACKUP_RETENTION_DAYS, {
+        envVarName: 'BACKUP_RETENTION_DAYS',
+        defaultValue: 30,
+      }),
+    },
+    cache: {
+      ttlBalanceSeconds: parseInteger(env.CACHE_TTL_BALANCE_S, {
+        envVarName: 'CACHE_TTL_BALANCE_S',
+        defaultValue: 300,
+      }),
+      ttlFeeSeconds: parseInteger(env.CACHE_TTL_FEE_S, {
+        envVarName: 'CACHE_TTL_FEE_S',
+        defaultValue: 3600,
+      }),
+    },
+    cdn: {
+      enabled: parseBoolean(env.CDN_ENABLED),
+      url: env.CDN_URL || '',
+      secondaryUrl: env.CDN_SECONDARY_URL || '',
+      regions: parseCsv(env.CDN_REGIONS),
+      cacheMaxAgeSeconds: parseInteger(env.CDN_CACHE_MAX_AGE_S, {
+        envVarName: 'CDN_CACHE_MAX_AGE_S',
+        defaultValue: 86400,
+      }),
+    },
+    crypto: {
+      databaseEncryptionKey: env.DATABASE_ENCRYPTION_KEY || '',
+    },
+    mobile: {
+      webauthnRpId: env.WEBAUTHN_RP_ID || 'future.app',
+      jwtSecret: env.MOBILE_JWT_SECRET || env.JWT_SECRET || '',
     },
   };
 }

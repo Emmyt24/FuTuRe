@@ -37,6 +37,15 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
+  // Navigation requests (e.g. a PWA shortcut opening /send directly): fall
+  // back to the cached app shell so deep links work offline instead of 404ing.
+  if (request.mode === 'navigate') {
+    e.respondWith(
+      fetch(request).catch(() => caches.match('/index.html'))
+    );
+    return;
+  }
+
   // Static assets: cache-first
   e.respondWith(
     caches.match(request).then((cached) => cached || fetch(request).then((res) => {
@@ -49,27 +58,19 @@ self.addEventListener('fetch', (e) => {
   );
 });
 
-// Background sync for queued transactions
+// Background sync: notify the client to prompt for secret key re-entry.
+// Queued items contain only the payment intent (no secret key), so the SW
+// cannot replay them autonomously — the user must authorise each one.
 self.addEventListener('sync', (e) => {
   if (e.tag === 'sync-transactions') {
-    e.waitUntil(syncPendingTransactions());
+    e.waitUntil(notifyClientToReplay());
   }
 });
 
-async function syncPendingTransactions() {
-  const db = await openDB();
-  const pending = await db.getAll('pending-transactions');
-  for (const tx of pending) {
-    try {
-      const res = await fetch('/api/stellar/payment/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(tx.payload),
-      });
-      if (res.ok) await db.delete('pending-transactions', tx.id);
-    } catch {
-      // Will retry on next sync
-    }
+async function notifyClientToReplay() {
+  const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  for (const client of clients) {
+    client.postMessage({ type: 'REPLAY_QUEUED_PAYMENTS' });
   }
 }
 

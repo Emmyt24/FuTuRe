@@ -1,26 +1,54 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+import { formatAssetAmount, normalizeAmountInput } from '../utils/formatAmount';
 
 const CURRENCIES = { XLM: 'Stellar Lumens', USDC: 'USD Coin', BTC: 'Bitcoin' };
 
+// Default fallback assets for callers that don't pass availableAssets
+const DEFAULT_ASSETS = [
+  { code: 'XLM', name: 'Stellar Lumens' },
+  { code: 'USDC', name: 'USD Coin' },
+  { code: 'BTC', name: 'Bitcoin' },
+];
+
 /**
  * AmountInput — numeric input with currency selector and live formatting.
- * Props: value, onChange, currency, onCurrencyChange, availableBalance
+ * Props: value, onChange, currency, onCurrencyChange, availableBalance,
+ *        availableAssets – array of { code, issuer?, balance?, name? }
+ *          When provided, the currency selector is populated from this list
+ *          instead of the hardcoded CURRENCIES constant, ensuring users can
+ *          only select assets they actually hold a trustline for.
+ *          Defaults to the static three-asset list for backward compatibility.
  */
-export function AmountInput({ value, onChange, currency = 'XLM', onCurrencyChange, availableBalance }) {
+export function AmountInput({ value, onChange, currency = 'XLM', onCurrencyChange, availableBalance, availableAssets }) {
+  const { t, i18n } = useTranslation();
   const [focused, setFocused] = useState(false);
 
+  // Derive the asset list: use availableAssets prop when supplied,
+  // otherwise fall back to the static default list for backward compatibility.
+  const assetOptions = useMemo(() => {
+    if (availableAssets && availableAssets.length > 0) {
+      return availableAssets.map(a => ({ code: a.code, label: a.name ?? a.code }));
+    }
+    return DEFAULT_ASSETS.map(a => ({ code: a.code, label: a.name }));
+  }, [availableAssets]);
+
   const handleChange = (e) => {
-    // Allow only valid decimal numbers
-    const raw = e.target.value.replace(/[^0-9.]/g, '').replace(/(\..*)\./g, '$1');
-    onChange?.(raw);
+    // Accept the locale's decimal separator (e.g. ',' in fr-FR) and
+    // normalise it to '.' so the stored/submitted value is unambiguous.
+    onChange?.(normalizeAmountInput(e.target.value, i18n.language));
   };
 
   const setMax = () => {
     if (availableBalance != null) onChange?.(String(availableBalance));
   };
 
+  // While not focused, display the amount using the active locale's
+  // grouping and decimal separators. The underlying `value` stored via
+  // onChange always uses '.' as the decimal separator, so it stays
+  // unambiguous for blockchain APIs regardless of display locale.
   const formatted = !focused && value
-    ? Number(value).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 7 })
+    ? formatAssetAmount(value, { maximumFractionDigits: 7, locale: i18n.language })
     : value;
 
   return (
@@ -35,7 +63,7 @@ export function AmountInput({ value, onChange, currency = 'XLM', onCurrencyChang
           onBlur={() => setFocused(false)}
           placeholder="0.0000000"
           style={{ paddingRight: availableBalance != null ? 52 : 10 }}
-          aria-label="Amount"
+          aria-label={t('amountInput.label')}
         />
         {availableBalance != null && (
           <button
@@ -43,6 +71,7 @@ export function AmountInput({ value, onChange, currency = 'XLM', onCurrencyChang
             onClick={setMax}
             style={maxBtnStyle}
             title={`Max: ${availableBalance}`}
+            aria-label={t('amountInput.maxLabel', { amount: availableBalance })}
           >
             MAX
           </button>
@@ -52,10 +81,10 @@ export function AmountInput({ value, onChange, currency = 'XLM', onCurrencyChang
         value={currency}
         onChange={e => onCurrencyChange?.(e.target.value)}
         style={selectStyle}
-        aria-label="Currency"
+        aria-label={t('amountInput.currency')}
       >
-        {Object.entries(CURRENCIES).map(([code, name]) => (
-          <option key={code} value={code} title={name}>{code}</option>
+        {assetOptions.map(({ code, label }) => (
+          <option key={code} value={code} title={label}>{code}</option>
         ))}
       </select>
     </div>

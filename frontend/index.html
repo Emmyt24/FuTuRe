@@ -1,12 +1,31 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" id="html-root">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0066cc" />
     <meta name="description" content="Send and receive XLM payments on the Stellar network" />
+    
+    <!-- Font preloading: System fonts are used, so preload critical CSS early -->
+    <!-- This ensures typography is available before render blocking CSS parses -->
+    <link rel="preload" href="/src/index.css" as="style" />
+    
     <link rel="manifest" href="/manifest.json" />
     <title>Stellar Remittance</title>
+    <script>
+      // Apply the stored/OS theme synchronously, before CSS/React load, so
+      // there's no flash of the wrong theme. Mirrors ThemeContext's logic
+      // (frontend/src/contexts/ThemeContext.jsx) — keep both in sync.
+      (function () {
+        try {
+          var stored = localStorage.getItem('theme_preference');
+          var theme = stored === 'dark' || stored === 'light'
+            ? stored
+            : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+          document.documentElement.classList.add('theme-' + theme);
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

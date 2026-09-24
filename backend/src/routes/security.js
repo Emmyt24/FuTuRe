@@ -3,12 +3,19 @@ import {
   oauth2,
   mfa,
   auditLogger,
-  threatDetector,
   securityScanner,
   incidentResponse,
   penetrationTester,
   complianceReporter
 } from '../security/index.js';
+import {
+  isIPBlocked,
+  blockIP,
+  unblockIP,
+  getSuspiciousPatterns,
+  clearOldPatterns,
+  detectAnomalousActivity,
+} from '../security/accountLockout.js';
 
 const router = express.Router();
 
@@ -75,10 +82,37 @@ router.post('/mfa/verify', (req, res) => {
 });
 
 // Audit log endpoints
+router.get('/audit-log', async (req, res) => {
+  try {
+    // Restrict to authenticated users (admin role check can be added)
+    if (!req.user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { userId, actionType, severity, limit, offset } = req.query;
+    const logs = await auditLogger.getAuditLog({
+      userId,
+      actionType,
+      severity,
+      limit: parseInt(limit) || 100,
+      offset: parseInt(offset) || 0,
+    });
+    res.json({ logs });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.get('/audit/logs', async (req, res) => {
   try {
-    const date = req.query.date;
-    const logs = await auditLogger.getAuditLog(date);
+    const filters = {
+      userId: req.query.userId,
+      actionType: req.query.actionType,
+      severity: req.query.severity,
+      limit: parseInt(req.query.limit) || 100,
+      offset: parseInt(req.query.offset) || 0,
+    };
+    const logs = await auditLogger.getAuditLog(filters);
     res.json({ logs });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -88,7 +122,8 @@ router.get('/audit/logs', async (req, res) => {
 router.get('/audit/security-events', async (req, res) => {
   try {
     const severity = req.query.severity || 'CRITICAL';
-    const events = await auditLogger.getSecurityEvents(severity);
+    const limit = parseInt(req.query.limit) || 100;
+    const events = await auditLogger.getSecurityEvents(severity, limit);
     res.json({ events });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -99,17 +134,54 @@ router.get('/audit/security-events', async (req, res) => {
 router.post('/threats/check', (req, res) => {
   try {
     const { userId, activity } = req.body;
-    const threats = threatDetector.detectAnomalousActivity(userId, activity);
+    const threats = detectAnomalousActivity(userId, activity);
     res.json({ threats });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
 });
 
-router.get('/threats/blocked-ips', (req, res) => {
+router.get('/threats/blocked-ips', async (req, res) => {
   try {
-    const patterns = threatDetector.getSuspiciousPatterns();
+    const limit = parseInt(req.query.limit) || 100;
+    const patterns = await getSuspiciousPatterns(limit);
     res.json({ patterns });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/threats/block-ip', async (req, res) => {
+  try {
+    const { ipAddress, reason } = req.body;
+    if (!ipAddress) {
+      return res.status(400).json({ error: 'IP address required' });
+    }
+    await blockIP(ipAddress, reason);
+    res.json({ message: 'IP blocked successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/threats/unblock-ip', async (req, res) => {
+  try {
+    const { ipAddress } = req.body;
+    if (!ipAddress) {
+      return res.status(400).json({ error: 'IP address required' });
+    }
+    await unblockIP(ipAddress);
+    res.json({ message: 'IP unblocked successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/threats/clear-old-patterns', async (req, res) => {
+  try {
+    const hours = parseInt(req.body.hours) || 24;
+    const cleared = await clearOldPatterns(hours);
+    res.json({ message: `Cleared ${cleared} old patterns` });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

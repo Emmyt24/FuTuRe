@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
+import { useTranslation } from 'react-i18next';
 
 /**
  * FormWizard — multi-step form with progress indicator.
@@ -8,6 +9,7 @@ import { AnimatePresence, motion } from 'framer-motion';
  *   onComplete: (allData) => void
  */
 export function FormWizard({ steps = [], onComplete }) {
+  const { t } = useTranslation();
   const [current, setCurrent] = useState(0);
   const [direction, setDirection] = useState(1);
 
@@ -33,20 +35,38 @@ export function FormWizard({ steps = [], onComplete }) {
 
   return (
     <div>
-      {/* Progress bar */}
-      <div style={{ display: 'flex', gap: 4, marginBottom: 20 }}>
+      {/* Progress indicator — announced to screen readers as a group with step position */}
+      <div
+        role="group"
+        aria-label={t('formWizard.progressLabel', { current: current + 1, total: steps.length })}
+        style={{ display: 'flex', gap: 4, marginBottom: 20 }}
+      >
         {steps.map((s, i) => (
-          <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
-            <div style={{
-              width: '100%', height: 4, borderRadius: 2,
-              background: i <= current ? '#0066cc' : '#e5e7eb',
-              transition: 'background 0.3s',
-            }} />
-            <span style={{ fontSize: 11, color: i === current ? '#0066cc' : '#888', fontWeight: i === current ? 700 : 400 }}>
+          <div
+            key={i}
+            style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}
+            aria-current={i === current ? 'step' : undefined}
+          >
+            <div
+              role="presentation"
+              style={{
+                width: '100%', height: 4, borderRadius: 2,
+                background: i <= current ? 'var(--primary)' : 'var(--border)',
+                transition: 'background 0.3s',
+              }}
+            />
+            <span
+              style={{ fontSize: 11, color: i === current ? 'var(--primary)' : 'var(--muted)', fontWeight: i === current ? 700 : 400 }}
+              aria-hidden={i !== current ? 'true' : undefined}
+            >
               {s.title}
             </span>
           </div>
         ))}
+      </div>
+      {/* Visually-hidden live region so step changes are announced */}
+      <div aria-live="polite" aria-atomic="true" className="sr-only">
+        {t('formWizard.stepAnnouncement', { title: step.title, current: current + 1, total: steps.length })}
       </div>
 
       {/* Step content */}
@@ -70,12 +90,12 @@ export function FormWizard({ steps = [], onComplete }) {
       <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
         {current > 0 && (
           <button type="button" onClick={() => go(-1)} style={backBtnStyle}>
-            ← Back
+            ← {t('common.back')}
           </button>
         )}
         <div style={{ flex: 1 }} />
         <button type="button" onClick={isLast ? finish : () => go(1)} style={{ width: 'auto' }}>
-          {isLast ? 'Submit' : 'Next →'}
+          {isLast ? t('common.submit') : `${t('common.next')} →`}
         </button>
       </div>
     </div>
@@ -83,7 +103,7 @@ export function FormWizard({ steps = [], onComplete }) {
 }
 
 const backBtnStyle = {
-  background: 'white', color: '#0066cc', border: '1px solid #0066cc',
+  background: 'var(--surface)', color: 'var(--primary)', border: '1px solid var(--primary)',
   borderRadius: 4, padding: '10px 16px', fontSize: 14, cursor: 'pointer',
   width: 'auto', minHeight: 44,
 };
