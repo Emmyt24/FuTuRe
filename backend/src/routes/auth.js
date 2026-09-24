@@ -2,10 +2,17 @@ import express from 'express';
 import { body, validationResult } from 'express-validator';
 import { hashPassword, verifyPassword } from '../auth/password.js';
 import { createUser, findUser, getUserById } from '../auth/userStore.js';
-import { signAccessToken, signRefreshToken, verifyToken } from '../auth/tokens.js';
+import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../auth/tokens.js';
+import { saveRefreshToken, consumeRefreshToken, revokeFamily, revokeUserTokens } from '../auth/refreshTokenStore.js';
 import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
+
+function issueRefreshToken(payload, familyId) {
+  const { token, jti, familyId: family, expiresAt } = signRefreshToken(payload, { familyId });
+  saveRefreshToken({ jti, familyId: family, userId: payload.sub, expiresAt });
+  return token;
+}
 
 const validateBody = (req, res, next) => {
   const errors = validationResult(req);
@@ -40,7 +47,7 @@ router.post('/login', userRules, validateBody, async (req, res) => {
   const payload = { sub: user.id, username: user.username };
   res.json({
     accessToken: signAccessToken(payload),
-    refreshToken: signRefreshToken(payload),
+    refreshToken: issueRefreshToken(payload),
   });
 });
 
@@ -48,16 +55,38 @@ router.post('/login', userRules, validateBody, async (req, res) => {
 router.post('/refresh', (req, res) => {
   const { refreshToken } = req.body;
   if (!refreshToken) return res.status(400).json({ error: 'refreshToken required' });
+  let claims;
   try {
-    const { sub, username } = verifyToken(refreshToken);
-    res.json({ accessToken: signAccessToken({ sub, username }) });
+    claims = verifyRefreshToken(refreshToken);
   } catch {
-    res.status(401).json({ error: 'Invalid or expired refresh token' });
+    return res.status(401).json({ error: 'Invalid or expired refresh token' });
   }
+  const { sub, username, jti, familyId } = claims;
+  const result = consumeRefreshToken(jti, familyId);
+  if (!result.ok) {
+    const error = result.reason === 'replay'
+      ? 'Refresh token reuse detected; session revoked'
+      : 'Invalid or expired refresh token';
+    return res.status(401).json({ error });
+  }
+  const payload = { sub, username };
+  res.json({
+    accessToken: signAccessToken(payload),
+    refreshToken: issueRefreshToken(payload, familyId),
+  });
 });
 
-// POST /api/auth/logout  (client should discard tokens; server-side blacklist can be added later)
-router.post('/logout', requireAuth, (_req, res) => {
+// POST /api/auth/logout — revokes the supplied refresh token family, or all user tokens if none given
+router.post('/logout', requireAuth, (req, res) => {
+  const { refreshToken } = req.body ?? {};
+  if (refreshToken) {
+    try {
+      const { familyId, sub } = verifyRefreshToken(refreshToken);
+      if (sub === req.user.sub) revokeFamily(familyId);
+    } catch { /* ignore invalid token */ }
+  } else {
+    revokeUserTokens(req.user.sub);
+  }
   res.json({ message: 'Logged out successfully' });
 });
 
