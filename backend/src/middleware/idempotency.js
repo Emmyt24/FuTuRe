@@ -44,6 +44,10 @@ async function waitForResult(cacheKey, bodyHash) {
  * runs, so concurrent duplicate requests can't both slip past the cache-miss
  * check. A request that loses the claim polls for the in-flight request's
  * result and returns it, or 409s if it's still processing.
+ *
+ * Cache keys are scoped to the authenticated user and route so that keys
+ * cannot collide across users, tenants, or endpoints. This middleware must
+ * run AFTER requireAuth so req.user.id is available.
  */
 export const idempotencyMiddleware = async (req, res, next) => {
   const idempotencyKey = req.headers['idempotency-key'];
@@ -58,7 +62,15 @@ export const idempotencyMiddleware = async (req, res, next) => {
     return res.status(400).json({ error: 'Invalid Idempotency-Key format' });
   }
 
-  const cacheKey = `idempotency:${idempotencyKey}`;
+  // Idempotency keys on private endpoints require an authenticated user so
+  // that keys are strictly scoped per user and cannot leak across accounts.
+  const userId = req.user?.id;
+  if (!userId) {
+    return res.status(401).json({ error: 'Authentication required to use Idempotency-Key' });
+  }
+
+  const route = req.baseUrl + req.path;
+  const cacheKey = `idempotency:${userId}:${route}:${idempotencyKey}`;
   const bodyHash = crypto.createHash('sha256').update(JSON.stringify(req.body)).digest('hex');
 
   try {

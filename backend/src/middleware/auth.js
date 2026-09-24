@@ -49,3 +49,22 @@ export function requireOwnAccount(paramName = 'accountId') {
     }
   };
 }
+
+// Returns the stable identity used to scope idempotency keys. Prefers the
+// authenticated user id (req.user.id, falling back to the JWT subject) so
+// keys are isolated per user; unauthenticated callers are bucketed under
+// 'anonymous' and must be rejected by requireIdempotencyAuth on private routes.
+export function getIdempotencyScope(req) {
+  return req.user?.id || req.user?.sub || 'anonymous';
+}
+
+// Guards private endpoints that accept an idempotency key: if a key is
+// supplied without an authenticated user, reject the request so an anonymous
+// caller can never read or poison another user's cached response.
+export function requireIdempotencyAuth(req, res, next) {
+  const idempotencyKey = req.headers['idempotency-key'];
+  if (idempotencyKey && !req.user) {
+    return res.status(401).json({ error: 'Authentication required for idempotent requests' });
+  }
+  next();
+}
