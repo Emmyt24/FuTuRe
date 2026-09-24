@@ -4,13 +4,58 @@ import * as MultiSigService from '../services/multiSig.js';
 import { broadcastToAccount } from '../services/websocket.js';
 import { AppError, ErrorCodes } from '../middleware/errorHandler.js';
 import { idempotencyMiddleware } from '../middleware/idempotency.js';
+import { requireAuth } from '../middleware/auth.js';
 import logger from '../config/logger.js';
 
-// Intentionally public: every mutating route here requires a `sourceSecret`
-// (or a transaction already signed with one), so possession of the Stellar
-// secret key is the credential — the same model used by routes/stellar/*.
-// See #1102.
 const router = express.Router();
+
+router.use(requireAuth);
+
+async function callerPublicKey(req) {
+  return MultiSigService.getAuthenticatedPublicKey(req.user?.sub);
+}
+
+async function requireAccountSigner(req, res, next) {
+  if (req.user?.role === 'ADMIN') return next();
+  try {
+    const publicKey = await callerPublicKey(req);
+    const sourcePublicKey =
+      req.params.publicKey ?? req.body.sourcePublicKey ?? req.query.sourcePublicKey;
+    if (await MultiSigService.isAuthorizedSigner(sourcePublicKey, publicKey)) return next();
+    return res.status(403).json({ error: 'You are not authorized for this multi-sig account' });
+  } catch {
+    return res.status(500).json({ error: 'Failed to verify multi-sig authorization' });
+  }
+}
+
+async function requirePendingSigner(req, res, next) {
+  if (req.user?.role === 'ADMIN') return next();
+  try {
+    const publicKey = await callerPublicKey(req);
+    const access = await MultiSigService.authorizePendingTransaction(
+      req.params.txId ?? req.body.txId,
+      publicKey,
+    );
+    if (!access.pending) return res.status(404).json({ error: 'Transaction not found' });
+    if (!access.authorized)
+      return res.status(403).json({ error: 'You are not authorized for this transaction' });
+    req.multiSigPending = access.pending;
+    next();
+  } catch {
+    return res.status(500).json({ error: 'Failed to verify multi-sig authorization' });
+  }
+}
+
+async function requireSourceOwner(req, res, next) {
+  if (req.user?.role === 'ADMIN') return next();
+  try {
+    const publicKey = await callerPublicKey(req);
+    await MultiSigService.assertSourceSecretOwner(req.body.sourceSecret, publicKey);
+    next();
+  } catch {
+    return res.status(403).json({ error: 'Authenticated user does not own the source account' });
+  }
+}
 
 function logError(req, error, context = {}) {
   logger.error('route.error', {
@@ -70,22 +115,28 @@ function logError(req, error, context = {}) {
  *       500:
  *         description: Server error
  */
-router.post('/account/create', rules.createMultiSig, validate, async (req, res) => {
-  try {
-    const { sourceSecret, signers, thresholds, masterWeight } = req.body;
-    const result = await MultiSigService.createMultiSigAccount(
-      sourceSecret,
-      signers,
-      thresholds,
-      masterWeight
-    );
-    broadcastToAccount(result.publicKey, { type: 'multisig_created', ...result });
-    res.json(result);
-  } catch (error) {
-    logError(req, error);
-    res.status(500).json({ error: 'Failed to create multi-sig account' });
-  }
-});
+router.post(
+  '/account/create',
+  rules.createMultiSig,
+  validate,
+  requireSourceOwner,
+  async (req, res) => {
+    try {
+      const { sourceSecret, signers, thresholds, masterWeight } = req.body;
+      const result = await MultiSigService.createMultiSigAccount(
+        sourceSecret,
+        signers,
+        thresholds,
+        masterWeight,
+      );
+      broadcastToAccount(result.publicKey, { type: 'multisig_created', ...result });
+      res.json(result);
+    } catch (error) {
+      logError(req, error);
+      res.status(500).json({ error: 'Failed to create multi-sig account' });
+    }
+  },
+);
 
 /**
  * @swagger
@@ -106,15 +157,21 @@ router.post('/account/create', rules.createMultiSig, validate, async (req, res) 
  *       500:
  *         description: Server error
  */
-router.get('/account/:publicKey', rules.publicKeyParam, validate, async (req, res) => {
-  try {
-    const config = await MultiSigService.getMultiSigConfig(req.params.publicKey);
-    res.json(config);
-  } catch (error) {
-    logError(req, error, { publicKey: req.params.publicKey });
-    res.status(500).json({ error: 'Failed to retrieve multi-sig configuration' });
-  }
-});
+router.get(
+  '/account/:publicKey',
+  rules.publicKeyParam,
+  validate,
+  requireAccountSigner,
+  async (req, res) => {
+    try {
+      const config = await MultiSigService.getMultiSigConfig(req.params.publicKey);
+      res.json(config);
+    } catch (error) {
+      logError(req, error, { publicKey: req.params.publicKey });
+      res.status(500).json({ error: 'Failed to retrieve multi-sig configuration' });
+    }
+  },
+);
 
 /**
  * @swagger
@@ -147,16 +204,22 @@ router.get('/account/:publicKey', rules.publicKeyParam, validate, async (req, re
  *       500:
  *         description: Server error
  */
-router.post('/account/update', rules.updateMultiSig, validate, async (req, res) => {
-  try {
-    const { sourceSecret, ...updates } = req.body;
-    const result = await MultiSigService.updateMultiSigConfig(sourceSecret, updates);
-    res.json(result);
-  } catch (error) {
-    logError(req, error);
-    res.status(500).json({ error: 'Failed to update multi-sig configuration' });
-  }
-});
+router.post(
+  '/account/update',
+  rules.updateMultiSig,
+  validate,
+  requireSourceOwner,
+  async (req, res) => {
+    try {
+      const { sourceSecret, ...updates } = req.body;
+      const result = await MultiSigService.updateMultiSigConfig(sourceSecret, updates);
+      res.json(result);
+    } catch (error) {
+      logError(req, error);
+      res.status(500).json({ error: 'Failed to update multi-sig configuration' });
+    }
+  },
+);
 
 /**
  * @swagger
@@ -189,22 +252,29 @@ router.post('/account/update', rules.updateMultiSig, validate, async (req, res) 
  *       500:
  *         description: Server error
  */
-router.post('/transaction/build', idempotencyMiddleware, rules.buildMultiSigTx, validate, async (req, res) => {
-  try {
-    const { sourcePublicKey, destination, amount, assetCode } = req.body;
-    const result = await MultiSigService.buildMultiSigTransaction(
-      sourcePublicKey,
-      destination,
-      amount,
-      assetCode
-    );
-    broadcastToAccount(sourcePublicKey, { type: 'multisig_tx_pending', ...result });
-    res.json(result);
-  } catch (error) {
-    logError(req, error, { destination: req.body.destination, amount: req.body.amount });
-    res.status(500).json({ error: 'Failed to build multi-sig transaction' });
-  }
-});
+router.post(
+  '/transaction/build',
+  idempotencyMiddleware,
+  rules.buildMultiSigTx,
+  validate,
+  requireAccountSigner,
+  async (req, res) => {
+    try {
+      const { sourcePublicKey, destination, amount, assetCode } = req.body;
+      const result = await MultiSigService.buildMultiSigTransaction(
+        sourcePublicKey,
+        destination,
+        amount,
+        assetCode,
+      );
+      broadcastToAccount(sourcePublicKey, { type: 'multisig_tx_pending', ...result });
+      res.json(result);
+    } catch (error) {
+      logError(req, error, { destination: req.body.destination, amount: req.body.amount });
+      res.status(500).json({ error: 'Failed to build multi-sig transaction' });
+    }
+  },
+);
 
 /**
  * @swagger
@@ -232,22 +302,32 @@ router.post('/transaction/build', idempotencyMiddleware, rules.buildMultiSigTx, 
  *       500:
  *         description: Server error
  */
-router.post('/transaction/sign', rules.signMultiSigTx, validate, async (req, res, next) => {
-  try {
-    const { txId, signerSecret } = req.body;
-    const result = await MultiSigService.addSignature(txId, signerSecret);
-    res.json(result);
-  } catch (error) {
-    if (error.message?.includes('expired')) {
-      return next(new AppError(error.message, 410, ErrorCodes.CONFLICT));
+router.post(
+  '/transaction/sign',
+  rules.signMultiSigTx,
+  validate,
+  requirePendingSigner,
+  async (req, res, next) => {
+    try {
+      const { txId, signerSecret } = req.body;
+      if (req.user?.role !== 'ADMIN') {
+        const publicKey = await callerPublicKey(req);
+        await MultiSigService.assertSignerSecretOwner(signerSecret, publicKey);
+      }
+      const result = await MultiSigService.addSignature(txId, signerSecret);
+      res.json(result);
+    } catch (error) {
+      if (error.message?.includes('expired')) {
+        return next(new AppError(error.message, 410, ErrorCodes.CONFLICT));
+      }
+      if (error.message?.includes('not found')) {
+        return next(new AppError(error.message, 404, ErrorCodes.NOT_FOUND));
+      }
+      logError(req, error, { txId: req.body.txId });
+      next(error);
     }
-    if (error.message?.includes('not found')) {
-      return next(new AppError(error.message, 404, ErrorCodes.NOT_FOUND));
-    }
-    logError(req, error, { txId: req.body.txId });
-    next(error);
-  }
-});
+  },
+);
 
 /**
  * @swagger
@@ -271,17 +351,23 @@ router.post('/transaction/sign', rules.signMultiSigTx, validate, async (req, res
  *       500:
  *         description: Server error
  */
-router.post('/transaction/submit', rules.submitMultiSigTx, validate, async (req, res) => {
-  try {
-    const { txId } = req.body;
-    const result = await MultiSigService.submitMultiSigTransaction(txId);
-    broadcastToAccount(result.hash, { type: 'multisig_tx_submitted', ...result });
-    res.json(result);
-  } catch (error) {
-    logError(req, error, { txId: req.body.txId });
-    res.status(500).json({ error: 'Failed to submit multi-sig transaction' });
-  }
-});
+router.post(
+  '/transaction/submit',
+  rules.submitMultiSigTx,
+  validate,
+  requirePendingSigner,
+  async (req, res) => {
+    try {
+      const { txId } = req.body;
+      const result = await MultiSigService.submitMultiSigTransaction(txId);
+      broadcastToAccount(result.hash, { type: 'multisig_tx_submitted', ...result });
+      res.json(result);
+    } catch (error) {
+      logError(req, error, { txId: req.body.txId });
+      res.status(500).json({ error: 'Failed to submit multi-sig transaction' });
+    }
+  },
+);
 
 /**
  * @swagger
@@ -338,15 +424,21 @@ router.post('/transaction/verify', rules.verifyMultiSigTx, validate, async (req,
  *       500:
  *         description: Server error
  */
-router.get('/transaction/pending/:publicKey', rules.publicKeyParam, validate, async (req, res) => {
-  try {
-    const transactions = MultiSigService.getPendingTransactions(req.params.publicKey);
-    res.json({ transactions });
-  } catch (error) {
-    logError(req, error, { publicKey: req.params.publicKey });
-    res.status(500).json({ error: 'Failed to retrieve pending transactions' });
-  }
-});
+router.get(
+  '/transaction/pending/:publicKey',
+  rules.publicKeyParam,
+  validate,
+  requireAccountSigner,
+  async (req, res) => {
+    try {
+      const transactions = await MultiSigService.getPendingTransactions(req.params.publicKey);
+      res.json({ transactions });
+    } catch (error) {
+      logError(req, error, { publicKey: req.params.publicKey });
+      res.status(500).json({ error: 'Failed to retrieve pending transactions' });
+    }
+  },
+);
 
 /**
  * @swagger
@@ -368,9 +460,9 @@ router.get('/transaction/pending/:publicKey', rules.publicKeyParam, validate, as
  *       500:
  *         description: Server error
  */
-router.get('/transaction/:txId', async (req, res) => {
+router.get('/transaction/:txId', requirePendingSigner, async (req, res) => {
   try {
-    const tx = MultiSigService.getPendingTransaction(req.params.txId);
+    const tx = await MultiSigService.getPendingTransaction(req.params.txId);
     if (!tx) return res.status(404).json({ error: 'Transaction not found' });
     res.json(tx);
   } catch (error) {
@@ -397,7 +489,7 @@ router.get('/transaction/:txId', async (req, res) => {
  *       500:
  *         description: Server error
  */
-router.get('/expired', async (req, res, next) => {
+router.get('/expired', requireAccountSigner, async (req, res, next) => {
   try {
     const transactions = await MultiSigService.getExpiredTransactions(req.query.sourcePublicKey);
     res.json({ transactions });
