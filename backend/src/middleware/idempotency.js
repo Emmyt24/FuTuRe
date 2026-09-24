@@ -5,6 +5,7 @@ import { incrementCounter } from '../monitoring/metrics.js';
 
 const IDEMPOTENCY_TTL = 24 * 60 * 60; // 24 hours in seconds
 const IN_PROGRESS_TTL = 30; // seconds a claim is held while the handler runs
+const UNCERTAIN_TTL = 60; // seconds an ambiguous upstream failure is remembered
 const POLL_INTERVAL_MS = 200;
 const POLL_TIMEOUT_MS = 5000;
 
@@ -100,11 +101,24 @@ export const idempotencyMiddleware = async (req, res, next) => {
           .catch((error) => {
             logger.warn({ err: error?.message, idempotencyKey }, 'Failed to persist idempotent response to cache');
           });
-      } else {
-        // Release the claim so a retry after a failed attempt isn't stuck behind it
+      } else if (statusCode >= 400 && statusCode < 500) {
+        // Unambiguous client-side error: no on-chain transaction could have
+        // been generated, so release the claim to allow an immediate retry.
         redisBackend.delete(cacheKey).catch((error) => {
-          logger.warn({ err: error?.message, idempotencyKey }, 'Failed to release idempotency claim after error response');
+          logger.warn({ err: error?.message, idempotencyKey }, 'Failed to release idempotency claim after client error response');
         });
+      } else {
+        // 5xx / upstream failures (e.g. Horizon 504 timeouts, connection
+        // resets) are ambiguous: the transaction may already have reached the
+        // ledger. Keep the claim as 'failed' with a short TTL instead of
+        // deleting it, so an immediate retry with the same Idempotency-Key
+        // cannot trigger a duplicate submission.
+        const errorCode = data?.code || data?.error || 'upstream_error';
+        redisBackend
+          .set(cacheKey, { bodyHash, status: 'failed', statusCode, errorCode, response: data }, UNCERTAIN_TTL)
+          .catch((error) => {
+            logger.warn({ err: error?.message, idempotencyKey }, 'Failed to persist uncertain idempotency state after upstream error');
+          });
       }
 
       return originalJson(data);
