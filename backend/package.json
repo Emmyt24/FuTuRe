@@ -20,7 +20,8 @@
     "test:integration": "vitest run tests/stellar.integration.test.js",
     "test:db": "vitest run tests/database.framework.test.js",
     "test:integration:all": "vitest run tests/*.integration.test.js",
-    "db:seed": "node prisma/seed.js"
+    "db:seed": "node prisma/seed.js",
+    "db:rotate-encryption-keys": "node ../scripts/rotate-encryption-keys.mjs"
   },
   "prisma": {
     "seed": "node prisma/seed.js"
@@ -43,9 +44,11 @@
     "cors": "^2.8.5",
     "csrf-csrf": "^4.0.3",
     "dotenv": "^16.6.1",
+    "double-metaphone": "^2.0.0",
     "express": "^4.19.2",
     "express-rate-limit": "^7.5.0",
     "express-validator": "^7.3.1",
+    "fast-levenshtein": "^3.0.0",
     "helmet": "^7.1.0",
     "ioredis": "^5.3.2",
     "jsonwebtoken": "^9.0.0",
