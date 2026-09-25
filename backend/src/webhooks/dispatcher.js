@@ -2,32 +2,65 @@ import { getWebhook, getWebhooksForAccount, signPayload } from './store.js';
 import { validateWebhookUrl } from './urlValidator.js';
 import prisma from '../db/client.js';
 import logger from '../config/logger.js';
+import { Agent } from 'undici';
 
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [1000, 5000, 15000]; // ms, indexed by attempt number (0-based)
 
+/**
+ * Build an undici dispatcher that connects strictly to the pre-validated IP
+ * address, preventing a second DNS resolution (DNS rebinding / TOCTOU SSRF).
+ * The original hostname is preserved for TLS SNI (servername) and the HTTP
+ * Host header so certificate validation and virtual hosting still work.
+ */
+function createPinnedDispatcher(hostname, pinnedIp) {
+  return new Agent({
+    connect: {
+      // Pin the TCP connection to the exact IP that passed validation.
+      lookup: (_host, _opts, cb) => cb(null, pinnedIp, pinnedIp.includes(':') ? 6 : 4),
+      // Preserve the original hostname for TLS SNI / certificate validation.
+      servername: hostname,
+    },
+  });
+}
+
 async function deliverOnce(webhook, payload) {
-  // Re-check the URL at delivery time in case the resolved address changed
-  // since registration (DNS rebinding into a private/internal range).
+  // Re-check the URL at delivery time and capture the exact resolved IP so the
+  // subsequent fetch cannot be redirected to a private address via DNS
+  // rebinding (TOCTOU).
   const validation = await validateWebhookUrl(webhook.url);
   if (!validation.valid) {
     throw new Error(`Webhook URL failed validation: ${validation.error}`);
   }
 
+  const target = new URL(webhook.url);
+  const pinnedIp = validation.ip;
+  if (!pinnedIp) {
+    throw new Error('Webhook URL validation did not return a resolved IP address');
+  }
+
   const signature = signPayload(webhook.signingSecret, payload);
+  const dispatcher = createPinnedDispatcher(target.hostname, pinnedIp);
 
-  const res = await fetch(webhook.url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-FuTuRe-Signature': `sha256=${signature}`,
-      'X-Webhook-Id': webhook.id,
-    },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(5000),
-  });
+  try {
+    const res = await fetch(webhook.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-FuTuRe-Signature': `sha256=${signature}`,
+        'X-Webhook-Id': webhook.id,
+        // Preserve the original hostname for virtual hosting.
+        Host: target.host,
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5000),
+      dispatcher,
+    });
 
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  } finally {
+    await dispatcher.close();
+  }
 }
 
 /**
