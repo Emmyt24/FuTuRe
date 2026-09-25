@@ -6,6 +6,7 @@ import { Agent } from 'undici';
 
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [1000, 5000, 15000]; // ms, indexed by attempt number (0-based)
+const CLAIM_BATCH_SIZE = 50;
 
 /**
  * Build an undici dispatcher that connects strictly to the pre-validated IP
@@ -101,7 +102,12 @@ async function attemptDelivery(delivery) {
       const delay = RETRY_DELAYS[Math.min(attempt - 1, RETRY_DELAYS.length - 1)];
       return prisma.webhookDelivery.update({
         where: { id: delivery.id },
-        data: { attempt, lastError: err.message, nextAttemptAt: new Date(Date.now() + delay) },
+        data: {
+          status: 'PENDING',
+          attempt,
+          lastError: err.message,
+          nextAttemptAt: new Date(Date.now() + delay),
+        },
       });
     }
 
@@ -161,23 +167,59 @@ export async function dispatchEvent(accountId, eventType, data) {
 }
 
 /**
- * Scheduler tick: find every delivery that is due for a retry and attempt it.
- * Replaces the previous in-process setTimeout chain so pending retries are
- * durable across restarts.
+ * Atomically claim a disjoint batch of due deliveries for this instance.
+ *
+ * Uses PostgreSQL's `FOR UPDATE SKIP LOCKED` queue pattern so that concurrent
+ * backend instances each claim a non-overlapping set of rows: rows already
+ * locked by another instance are skipped rather than blocked on, and the
+ * UPDATE ... RETURNING transitions the claimed rows to PROCESSING in the same
+ * statement so no other instance can pick them up. This guarantees each
+ * delivery row is processed by exactly one instance.
+ */
+async function claimDueDeliveries(limit = CLAIM_BATCH_SIZE) {
+  return prisma.$queryRaw`
+    UPDATE webhook_deliveries
+    SET status = 'PROCESSING', updated_at = NOW()
+    WHERE id IN (
+      SELECT id FROM webhook_deliveries
+      WHERE status = 'PENDING' AND next_attempt_at <= NOW()
+      ORDER BY next_attempt_at ASC
+      LIMIT ${limit}
+      FOR UPDATE SKIP LOCKED
+    )
+    RETURNING *;
+  `;
+}
+
+/**
+ * Scheduler tick: atomically claim every delivery that is due for a retry and
+ * attempt it. Replaces the previous in-process setTimeout chain so pending
+ * retries are durable across restarts, and uses SELECT ... FOR UPDATE SKIP
+ * LOCKED so multiple instances never dispatch the same delivery twice.
  */
 export async function processDueWebhookDeliveries() {
-  const due = await prisma.webhookDelivery.findMany({
-    where: { status: 'PENDING', nextAttemptAt: { lte: new Date() } },
-    take: 100,
-  });
+  const claimed = await claimDueDeliveries();
 
-  for (const delivery of due) {
+  for (const delivery of claimed) {
     try {
       await attemptDelivery(delivery);
     } catch (err) {
       logger.error({ deliveryId: delivery.id, error: err.message }, 'Webhook delivery retry threw');
+      // Release the claim so the row can be retried on a later tick instead of
+      // being stranded in PROCESSING.
+      await prisma.webhookDelivery
+        .update({
+          where: { id: delivery.id },
+          data: { status: 'PENDING', lastError: err.message },
+        })
+        .catch((releaseErr) =>
+          logger.error(
+            { deliveryId: delivery.id, error: releaseErr.message },
+            'Failed to release webhook delivery claim',
+          ),
+        );
     }
   }
 
-  return due.length;
+  return claimed.length;
 }
